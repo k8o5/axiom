@@ -1,0 +1,1546 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ANSI STYLES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const (
+	Reset      = "\033[0m"
+	Bold       = "\033[1m"
+	Dim        = "\033[2m"
+	Italic     = "\033[3m"
+	Underline  = "\033[4m"
+	Black      = "\033[30m"
+	Red        = "\033[31m"
+	Green      = "\033[32m"
+	Yellow     = "\033[33m"
+	Blue       = "\033[34m"
+	Magenta    = "\033[35m"
+	Cyan       = "\033[36m"
+	White      = "\033[37m"
+	Gray       = "\033[90m"
+	BrightCyan = "\033[96m"
+	BgBlack    = "\033[40m"
+	BgRed      = "\033[41m"
+	BgGreen    = "\033[42m"
+	BgYellow   = "\033[43m"
+	BgBlue     = "\033[44m"
+	BgMagenta  = "\033[45m"
+	BgCyan     = "\033[46m"
+	BgGray     = "\033[48;5;236m"
+	BgDarkGray = "\033[48;5;234m"
+	ClearLine  = "\033[2K"
+	CursorUp   = "\033[1A"
+	HideCursor = "\033[?25l"
+	ShowCursor = "\033[?25h"
+)
+
+// Syntax highlighting colors
+const (
+	SynKeyword = "\033[38;5;198m" // Pink
+	SynString  = "\033[38;5;114m" // Green
+	SynNumber  = "\033[38;5;209m" // Orange
+	SynComment = "\033[38;5;242m" // Gray
+	SynFunc    = "\033[38;5;81m"  // Cyan
+	SynType    = "\033[38;5;81m"  // Cyan
+)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONFIG
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func getConfigDir() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".axiom")
+}
+
+func getConfigPath() string {
+	return filepath.Join(getConfigDir(), "config.json")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATE & TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+type Message struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type ProviderConfig struct {
+	Endpoint string `json:"endpoint"`
+	APIKey   string `json:"apiKey"`
+	Model    string `json:"model"`
+}
+
+type SavedConfig struct {
+	Provider string                    `json:"provider"`
+	Configs  map[string]ProviderConfig `json:"configs"`
+}
+
+var state = struct {
+	provider   string
+	configs    map[string]ProviderConfig
+	connected  bool
+	history    []Message
+	cmdHistory []string
+	startTime  time.Time
+	toolCalls  int
+	lastCost   float64
+	tokens     int
+}{
+	provider:  "google",
+	configs:   make(map[string]ProviderConfig),
+	history:   []Message{},
+	startTime: time.Now(),
+}
+
+type APIRequest struct {
+	URL     string
+	Headers map[string]string
+	Body    interface{}
+}
+
+type ProviderDef struct {
+	Name            string
+	Type            string
+	DefaultModel    string
+	DefaultEndpoint string
+	BuildRequest    func(msgs []Message, cfg ProviderConfig) APIRequest
+}
+
+var PROVIDERS map[string]ProviderDef
+
+func init() {
+	PROVIDERS = map[string]ProviderDef{
+		"google": {
+			Name: "Gemini", Type: "cloud", DefaultModel: "gemini-2.0-flash-exp",
+			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
+				var contents []map[string]interface{}
+				for _, m := range msgs {
+					role := "user"
+					if m.Role == "assistant" {
+						role = "model"
+					}
+					if len(contents) > 0 && contents[len(contents)-1]["role"] == role {
+						parts := contents[len(contents)-1]["parts"].([]map[string]interface{})
+						parts[0]["text"] = parts[0]["text"].(string) + "\n\n" + m.Content
+					} else {
+						contents = append(contents, map[string]interface{}{
+							"role":  role,
+							"parts": []map[string]interface{}{{"text": m.Content}},
+						})
+					}
+				}
+				return APIRequest{
+					URL:     "https://generativelanguage.googleapis.com/v1beta/models/" + cfg.Model + ":generateContent?key=" + cfg.APIKey,
+					Headers: map[string]string{"Content-Type": "application/json"},
+					Body: map[string]interface{}{
+						"contents":         contents,
+						"generationConfig": map[string]interface{}{"temperature": 0.7, "maxOutputTokens": 8192},
+					},
+				}
+			},
+		},
+		"openai": {
+			Name: "OpenAI", Type: "cloud", DefaultModel: "gpt-4o",
+			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
+				return APIRequest{
+					URL:     "https://api.openai.com/v1/chat/completions",
+					Headers: map[string]string{"Authorization": "Bearer " + cfg.APIKey, "Content-Type": "application/json"},
+					Body:    map[string]interface{}{"model": cfg.Model, "messages": msgs, "temperature": 0.7},
+				}
+			},
+		},
+		"anthropic": {
+			Name: "Anthropic", Type: "cloud", DefaultModel: "claude-sonnet-4-20250514",
+			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
+				filtered := []Message{}
+				for _, m := range msgs {
+					if m.Role != "system" {
+						filtered = append(filtered, m)
+					}
+				}
+				return APIRequest{
+					URL: "https://api.anthropic.com/v1/messages",
+					Headers: map[string]string{
+						"x-api-key": cfg.APIKey, "Content-Type": "application/json",
+						"anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true",
+					},
+					Body: map[string]interface{}{"model": cfg.Model, "max_tokens": 8192, "messages": filtered},
+				}
+			},
+		},
+		"mistral": {
+			Name: "Mistral", Type: "cloud", DefaultModel: "mistral-large-latest",
+			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
+				return APIRequest{
+					URL:     "https://api.mistral.ai/v1/chat/completions",
+					Headers: map[string]string{"Authorization": "Bearer " + cfg.APIKey, "Content-Type": "application/json"},
+					Body:    map[string]interface{}{"model": cfg.Model, "messages": msgs, "temperature": 0.7},
+				}
+			},
+		},
+		"groq": {
+			Name: "Groq", Type: "cloud", DefaultModel: "llama-3.3-70b-versatile",
+			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
+				return APIRequest{
+					URL:     "https://api.groq.com/openai/v1/chat/completions",
+					Headers: map[string]string{"Authorization": "Bearer " + cfg.APIKey, "Content-Type": "application/json"},
+					Body:    map[string]interface{}{"model": cfg.Model, "messages": msgs, "temperature": 0.7},
+				}
+			},
+		},
+		"together": {
+			Name: "Together", Type: "cloud", DefaultModel: "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
+				return APIRequest{
+					URL:     "https://api.together.xyz/v1/chat/completions",
+					Headers: map[string]string{"Authorization": "Bearer " + cfg.APIKey, "Content-Type": "application/json"},
+					Body:    map[string]interface{}{"model": cfg.Model, "messages": msgs, "temperature": 0.7},
+				}
+			},
+		},
+		"openrouter": {
+			Name: "OpenRouter", Type: "cloud", DefaultModel: "anthropic/claude-3.5-sonnet",
+			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
+				return APIRequest{
+					URL:     "https://openrouter.ai/api/v1/chat/completions",
+					Headers: map[string]string{"Authorization": "Bearer " + cfg.APIKey, "Content-Type": "application/json"},
+					Body:    map[string]interface{}{"model": cfg.Model, "messages": msgs},
+				}
+			},
+		},
+		"ollama": {
+			Name: "Ollama", Type: "local", DefaultModel: "llama3.2", DefaultEndpoint: "http://localhost:11434/v1/chat/completions",
+			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
+				headers := map[string]string{"Content-Type": "application/json"}
+				if cfg.APIKey != "" {
+					headers["Authorization"] = "Bearer " + cfg.APIKey
+				}
+				return APIRequest{URL: cfg.Endpoint, Headers: headers, Body: map[string]interface{}{"model": cfg.Model, "messages": msgs, "stream": false}}
+			},
+		},
+		"lmstudio": {
+			Name: "LM Studio", Type: "local", DefaultModel: "local-model", DefaultEndpoint: "http://localhost:1234/v1/chat/completions",
+			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
+				return APIRequest{URL: cfg.Endpoint, Headers: map[string]string{"Content-Type": "application/json"}, Body: map[string]interface{}{"model": cfg.Model, "messages": msgs, "stream": false}}
+			},
+		},
+		"llamacpp": {
+			Name: "llama.cpp", Type: "local", DefaultModel: "default", DefaultEndpoint: "http://localhost:8080/v1/chat/completions",
+			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
+				return APIRequest{URL: cfg.Endpoint, Headers: map[string]string{"Content-Type": "application/json"}, Body: map[string]interface{}{"model": cfg.Model, "messages": msgs, "stream": false}}
+			},
+		},
+		"cloudflare": {
+			Name: "Cloudflare", Type: "custom", DefaultModel: "@cf/meta/llama-3.1-8b-instruct",
+			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
+				headers := map[string]string{"Content-Type": "application/json"}
+				if cfg.APIKey != "" {
+					headers["Authorization"] = "Bearer " + cfg.APIKey
+				}
+				return APIRequest{URL: cfg.Endpoint, Headers: headers, Body: map[string]interface{}{"model": cfg.Model, "messages": msgs}}
+			},
+		},
+		"custom": {
+			Name: "Custom", Type: "custom",
+			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
+				headers := map[string]string{"Content-Type": "application/json"}
+				if cfg.APIKey != "" {
+					headers["Authorization"] = "Bearer " + cfg.APIKey
+				}
+				return APIRequest{URL: cfg.Endpoint, Headers: headers, Body: map[string]interface{}{"model": cfg.Model, "messages": msgs}}
+			},
+		},
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONFIG PERSISTENCE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func loadConfig() error {
+	data, err := os.ReadFile(getConfigPath())
+	if err != nil {
+		return err
+	}
+	var saved SavedConfig
+	if err := json.Unmarshal(data, &saved); err != nil {
+		return err
+	}
+	if saved.Provider != "" {
+		state.provider = saved.Provider
+	}
+	if saved.Configs != nil {
+		state.configs = saved.Configs
+		if _, ok := state.configs[state.provider]; ok {
+			state.connected = true
+		}
+	}
+	return nil
+}
+
+func saveConfig() error {
+	os.MkdirAll(getConfigDir(), 0755)
+	data, _ := json.MarshalIndent(SavedConfig{Provider: state.provider, Configs: state.configs}, "", "  ")
+	return os.WriteFile(getConfigPath(), data, 0600)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TERMINAL UI COMPONENTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func clearScreen() {
+	fmt.Print("\033[H\033[2J")
+}
+
+func getTermWidth() int {
+	return 80 // Default, could use terminal size detection
+}
+
+func stripAnsi(s string) string {
+	re := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	return re.ReplaceAllString(s, "")
+}
+
+// Render markdown-style formatting
+func renderMarkdown(text string) string {
+	// Code blocks first (to protect them from other formatting)
+	codeBlockRe := regexp.MustCompile("(?s)```(\\w*)\\n(.*?)```")
+	text = codeBlockRe.ReplaceAllStringFunc(text, func(match string) string {
+		parts := codeBlockRe.FindStringSubmatch(match)
+		lang := parts[1]
+		code := parts[2]
+		return renderCodeBlock(code, lang)
+	})
+
+	// Inline code
+	inlineCodeRe := regexp.MustCompile("`([^`]+)`")
+	text = inlineCodeRe.ReplaceAllString(text, BgDarkGray+Cyan+"$1"+Reset)
+
+	// Bold
+	boldRe := regexp.MustCompile(`\*\*([^*]+)\*\*`)
+	text = boldRe.ReplaceAllString(text, Bold+"$1"+Reset)
+
+	// Italic
+	italicRe := regexp.MustCompile(`\*([^*]+)\*`)
+	text = italicRe.ReplaceAllString(text, Italic+"$1"+Reset)
+
+	// Headers
+	h1Re := regexp.MustCompile(`(?m)^# (.+)$`)
+	text = h1Re.ReplaceAllString(text, Bold+Cyan+"$1"+Reset)
+
+	h2Re := regexp.MustCompile(`(?m)^## (.+)$`)
+	text = h2Re.ReplaceAllString(text, Bold+"$1"+Reset)
+
+	// Bullet points
+	bulletRe := regexp.MustCompile(`(?m)^(\s*)[-*] (.+)$`)
+	text = bulletRe.ReplaceAllString(text, "$1"+Cyan+"•"+Reset+" $2")
+
+	// Numbered lists
+	numRe := regexp.MustCompile(`(?m)^(\s*)(\d+)\. (.+)$`)
+	text = numRe.ReplaceAllString(text, "$1"+Cyan+"$2."+Reset+" $3")
+
+	return text
+}
+
+func renderCodeBlock(code, lang string) string {
+	lines := strings.Split(strings.TrimRight(code, "\n"), "\n")
+	var result strings.Builder
+
+	result.WriteString("\n" + Gray + "  ┌─")
+	if lang != "" {
+		result.WriteString(" " + lang + " ")
+	}
+	result.WriteString("─────────────────────────────────────────" + Reset + "\n")
+
+	for _, line := range lines {
+		highlighted := highlightSyntax(line, lang)
+		result.WriteString(Gray + "  │ " + Reset + highlighted + "\n")
+	}
+
+	result.WriteString(Gray + "  └──────────────────────────────────────────────" + Reset + "\n")
+	return result.String()
+}
+
+func highlightSyntax(line, lang string) string {
+	if lang == "" {
+		return line
+	}
+
+	keywords := map[string][]string{
+		"go":     {"func", "package", "import", "return", "if", "else", "for", "range", "var", "const", "type", "struct", "interface", "map", "chan", "go", "defer", "select", "case", "default", "break", "continue", "switch", "nil", "true", "false"},
+		"js":     {"function", "const", "let", "var", "return", "if", "else", "for", "while", "class", "extends", "import", "export", "default", "async", "await", "try", "catch", "throw", "new", "this", "null", "undefined", "true", "false"},
+		"python": {"def", "class", "import", "from", "return", "if", "elif", "else", "for", "while", "try", "except", "raise", "with", "as", "None", "True", "False", "and", "or", "not", "in", "is", "lambda", "yield", "async", "await"},
+		"rust":   {"fn", "let", "mut", "const", "if", "else", "for", "while", "loop", "match", "struct", "enum", "impl", "trait", "pub", "use", "mod", "return", "self", "Self", "true", "false", "None", "Some", "Ok", "Err"},
+	}
+
+	result := line
+
+	// Comments
+	if strings.Contains(line, "//") {
+		idx := strings.Index(line, "//")
+		result = line[:idx] + SynComment + line[idx:] + Reset
+		return result
+	}
+	if strings.HasPrefix(strings.TrimSpace(line), "#") && lang == "python" {
+		return SynComment + line + Reset
+	}
+
+	// Strings
+	stringRe := regexp.MustCompile(`"[^"]*"|'[^']*'` + "`[^`]*`")
+	result = stringRe.ReplaceAllString(result, SynString+"$0"+Reset)
+
+	// Numbers
+	numRe := regexp.MustCompile(`\b(\d+\.?\d*)\b`)
+	result = numRe.ReplaceAllString(result, SynNumber+"$1"+Reset)
+
+	// Keywords
+	if kws, ok := keywords[lang]; ok {
+		for _, kw := range kws {
+			kwRe := regexp.MustCompile(`\b(` + kw + `)\b`)
+			result = kwRe.ReplaceAllString(result, SynKeyword+"$1"+Reset)
+		}
+	}
+
+	return result
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UI OUTPUT FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func printLogo() {
+	logo := `
+   ` + Cyan + Bold + `▄▀▄ ▀▄▀ █ ▄▀▄ █▄ ▄█` + Reset + `
+   ` + Cyan + `█▀█ ▄▀▄ █ ▀▄▀ █ ▀ █` + Reset + `
+`
+	fmt.Print(logo)
+	fmt.Println(Gray + "   AI-Powered Code Editor" + Reset)
+	fmt.Println()
+}
+
+func printStatusBar() {
+	width := getTermWidth()
+	cwd, _ := os.Getwd()
+	cwd = filepath.Base(cwd)
+
+	providerName := "disconnected"
+	providerColor := Red
+	model := ""
+
+	if state.connected {
+		if p, ok := PROVIDERS[state.provider]; ok {
+			providerName = strings.ToLower(p.Name)
+			providerColor = Green
+			cfg := state.configs[state.provider]
+			model = cfg.Model
+			if model == "" {
+				model = p.DefaultModel
+			}
+			if len(model) > 25 {
+				model = model[:22] + "..."
+			}
+		}
+	}
+
+	elapsed := time.Since(state.startTime).Truncate(time.Second)
+
+	// Build status items
+	left := fmt.Sprintf(" %s%s%s", Cyan, cwd, Reset)
+	
+	right := fmt.Sprintf("%s%s●%s %s", providerColor, Bold, Reset, providerName)
+	if model != "" {
+		right += fmt.Sprintf(" %s│%s %s", Gray, Reset, model)
+	}
+	right += fmt.Sprintf(" %s│%s %s", Gray, Reset, elapsed)
+	if state.toolCalls > 0 {
+		right += fmt.Sprintf(" %s│%s %d tools", Gray, Reset, state.toolCalls)
+	}
+	right += " "
+
+	leftLen := len(stripAnsi(left))
+	rightLen := len(stripAnsi(right))
+	padding := width - leftLen - rightLen
+	if padding < 0 {
+		padding = 0
+	}
+
+	fmt.Printf("%s%s%s%s%s%s\n", BgGray, left, strings.Repeat(" ", padding), right, Reset, "")
+}
+
+func printDivider() {
+	fmt.Println(Gray + strings.Repeat("─", getTermWidth()) + Reset)
+}
+
+func printToolCall(name string, args map[string]interface{}, result map[string]interface{}) {
+	// Icon based on tool
+	icon := "●"
+	color := Yellow
+	switch name {
+	case "read_file":
+		icon = "◉"
+		color = Blue
+	case "write_file":
+		icon = "◈"
+		color = Green
+	case "edit_lines":
+		icon = "◇"
+		color = Magenta
+	case "search_file":
+		icon = "◎"
+		color = Cyan
+	case "list_files":
+		icon = "◐"
+		color = Blue
+	case "shell":
+		icon = "▶"
+		color = Yellow
+	}
+
+	// Compact output
+	fmt.Printf("\n  %s%s%s %s%s%s", color, icon, Reset, Bold, name, Reset)
+
+	// Show key args inline
+	if filename, ok := args["filename"].(string); ok {
+		fmt.Printf(" %s%s%s", Gray, filename, Reset)
+	}
+	if cmd, ok := args["command"].(string); ok {
+		displayCmd := cmd
+		if len(displayCmd) > 40 {
+			displayCmd = displayCmd[:37] + "..."
+		}
+		fmt.Printf(" %s%s%s", Gray, displayCmd, Reset)
+	}
+
+	// Result indicator
+	if _, ok := result["error"]; ok {
+		errMsg, _ := result["error"].(string)
+		if len(errMsg) > 50 {
+			errMsg = errMsg[:47] + "..."
+		}
+		fmt.Printf(" %s✗ %s%s\n", Red, errMsg, Reset)
+	} else if _, ok := result["success"]; ok {
+		fmt.Printf(" %s✓%s\n", Green, Reset)
+	} else if files, ok := result["files"].([]string); ok {
+		fmt.Printf(" %s→ %d files%s\n", Gray, len(files), Reset)
+	} else if content, ok := result["content"].(string); ok {
+		lines := strings.Split(content, "\n")
+		fmt.Printf(" %s→ %d lines%s\n", Gray, len(lines), Reset)
+	} else if matches, ok := result["matches"].(string); ok {
+		count := strings.Count(matches, "--- Match")
+		fmt.Printf(" %s→ %d matches%s\n", Gray, count, Reset)
+	} else if stdout, ok := result["stdout"].(string); ok {
+		stdout = strings.TrimSpace(stdout)
+		if stdout == "" {
+			fmt.Printf(" %s✓%s\n", Green, Reset)
+		} else {
+			lines := strings.Split(stdout, "\n")
+			fmt.Printf(" %s→ %d lines output%s\n", Gray, len(lines), Reset)
+			// Show first 3 lines
+			for i, line := range lines {
+				if i >= 3 {
+					fmt.Printf("    %s... +%d more%s\n", Dim, len(lines)-3, Reset)
+					break
+				}
+				if len(line) > 60 {
+					line = line[:57] + "..."
+				}
+				fmt.Printf("    %s%s%s\n", Dim, line, Reset)
+			}
+		}
+	} else {
+		fmt.Printf(" %s✓%s\n", Green, Reset)
+	}
+}
+
+func printFileDiff(filename string, oldLines, newLines []string, startLine int) {
+	fmt.Printf("\n  %s%s─── %s%s\n", Gray, Bold, filename, Reset)
+
+	maxOld := 3
+	maxNew := 5
+
+	// Show removed lines (old)
+	shown := 0
+	for i, line := range oldLines {
+		if shown >= maxOld {
+			fmt.Printf("  %s- ... +%d lines removed%s\n", Red+Dim, len(oldLines)-maxOld, Reset)
+			break
+		}
+		lineNum := startLine + i
+		displayLine := line
+		if len(displayLine) > 60 {
+			displayLine = displayLine[:57] + "..."
+		}
+		fmt.Printf("  %s%d │- %s%s\n", Red+Dim, lineNum, displayLine, Reset)
+		shown++
+	}
+
+	// Show added lines (new)
+	shown = 0
+	for i, line := range newLines {
+		if shown >= maxNew {
+			fmt.Printf("  %s+ ... +%d lines added%s\n", Green+Dim, len(newLines)-maxNew, Reset)
+			break
+		}
+		lineNum := startLine + i
+		displayLine := line
+		if len(displayLine) > 60 {
+			displayLine = displayLine[:57] + "..."
+		}
+		fmt.Printf("  %s%d │+ %s%s\n", Green, lineNum, displayLine, Reset)
+		shown++
+	}
+}
+
+func printAssistantMessage(content string) {
+	fmt.Println()
+
+	// Process markdown
+	rendered := renderMarkdown(content)
+
+	// Word wrap and print
+	lines := strings.Split(rendered, "\n")
+	for _, line := range lines {
+		// Handle code blocks (already formatted)
+		if strings.HasPrefix(strings.TrimSpace(line), "│") || strings.HasPrefix(strings.TrimSpace(line), "┌") || strings.HasPrefix(strings.TrimSpace(line), "└") {
+			fmt.Println(line)
+			continue
+		}
+
+		// Word wrap regular text at ~75 chars
+		if len(stripAnsi(line)) > 75 {
+			words := strings.Fields(line)
+			current := ""
+			for _, word := range words {
+				testLen := len(stripAnsi(current)) + len(stripAnsi(word)) + 1
+				if testLen > 75 && current != "" {
+					fmt.Println("  " + current)
+					current = word
+				} else {
+					if current != "" {
+						current += " "
+					}
+					current += word
+				}
+			}
+			if current != "" {
+				fmt.Println("  " + current)
+			}
+		} else if line == "" {
+			fmt.Println()
+		} else {
+			fmt.Println("  " + line)
+		}
+	}
+	fmt.Println()
+}
+
+func printUserMessage(text string) {
+	fmt.Printf("\n  %s%s❯%s %s\n", Cyan, Bold, Reset, text)
+}
+
+func printError(msg string) {
+	fmt.Printf("\n  %s✗ %s%s\n", Red, msg, Reset)
+}
+
+func printSuccess(msg string) {
+	fmt.Printf("\n  %s✓%s %s\n", Green, Reset, msg)
+}
+
+func printInfo(msg string) {
+	fmt.Printf("\n  %sℹ%s %s\n", Blue, Reset, msg)
+}
+
+func printSpinner(done chan bool, message string) {
+	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	i := 0
+	for {
+		select {
+		case <-done:
+			fmt.Printf("\r%s\r", ClearLine)
+			return
+		default:
+			fmt.Printf("\r  %s%s%s %s", Cyan, frames[i%len(frames)], Reset, Dim+message+Reset)
+			time.Sleep(80 * time.Millisecond)
+			i++
+		}
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELP & WELCOME
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func printWelcome() {
+	clearScreen()
+	printLogo()
+
+	if state.connected {
+		p := PROVIDERS[state.provider]
+		cfg := state.configs[state.provider]
+		model := cfg.Model
+		if model == "" {
+			model = p.DefaultModel
+		}
+		fmt.Printf("  %sConnected to %s%s%s using %s%s%s\n", Dim, Reset+Green, p.Name, Reset+Dim, Reset+Cyan, model, Reset)
+	} else {
+		fmt.Printf("  %sNo provider configured. Type %s/config%s to get started.%s\n", Dim, Yellow, Dim, Reset)
+	}
+
+	fmt.Println()
+	printDivider()
+}
+
+func printHelp() {
+	fmt.Println()
+	fmt.Printf("  %s%sCOMMANDS%s\n\n", Bold, Cyan, Reset)
+
+	commands := [][]string{
+		{"/config", "Configure AI provider"},
+		{"/model", "Change model"},
+		{"/clear", "Clear conversation"},
+		{"/status", "Show session info"},
+		{"/files", "List project files"},
+		{"/help", "Show this help"},
+		{"/exit", "Exit Axiom"},
+	}
+
+	for _, cmd := range commands {
+		fmt.Printf("  %s%-12s%s %s\n", Yellow, cmd[0], Reset, Dim+cmd[1]+Reset)
+	}
+
+	fmt.Println()
+	fmt.Printf("  %sJust type naturally to chat or request code changes.%s\n", Dim, Reset)
+	fmt.Println()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CORE AI LOGIC (preserved from original)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func parseAIResponse(data map[string]interface{}, rawString string) string {
+	if result, ok := data["result"].(map[string]interface{}); ok {
+		if _, hasChoices := result["choices"]; hasChoices {
+			data = result
+		} else if respContent, hasResp := result["response"].(string); hasResp {
+			return respContent
+		}
+	}
+
+	if choices, ok := data["choices"].([]interface{}); ok && len(choices) > 0 {
+		choice := choices[0].(map[string]interface{})
+		if message, ok := choice["message"].(map[string]interface{}); ok {
+			if toolCalls, ok := message["tool_calls"].([]interface{}); ok && len(toolCalls) > 0 {
+				tc := toolCalls[0].(map[string]interface{})
+				funcObj, hasFunc := tc["function"].(map[string]interface{})
+				name := ""
+				args := interface{}("")
+				if hasFunc {
+					name, _ = funcObj["name"].(string)
+					args = funcObj["arguments"]
+				} else {
+					name, _ = tc["name"].(string)
+					args = tc["arguments"]
+				}
+				jsn, _ := json.Marshal(map[string]interface{}{"tool": name, "args": args})
+				return string(jsn)
+			}
+
+			content, _ := message["content"].(string)
+			reasoning, _ := message["reasoning_content"].(string)
+			if reasoning == "" {
+				reasoning, _ = message["reasoning"].(string)
+			}
+
+			if reasoning != "" || content != "" {
+				out := ""
+				if reasoning != "" {
+					out += "*thinking...*\n" + reasoning + "\n\n"
+				}
+				if content != "" {
+					out += content
+				}
+				return strings.TrimSpace(out)
+			}
+		}
+	}
+
+	if cands, ok := data["candidates"].([]interface{}); ok && len(cands) > 0 {
+		if content, ok := cands[0].(map[string]interface{})["content"].(map[string]interface{}); ok {
+			if parts, ok := content["parts"].([]interface{}); ok && len(parts) > 0 {
+				if text, ok := parts[0].(map[string]interface{})["text"].(string); ok {
+					return text
+				}
+			}
+		}
+	}
+
+	if resp, ok := data["response"].(string); ok {
+		return resp
+	}
+	if text, ok := data["text"].(string); ok {
+		return text
+	}
+
+	return rawString
+}
+
+func runTool(name string, args map[string]interface{}) map[string]interface{} {
+	result := make(map[string]interface{})
+	defer func() {
+		if r := recover(); r != nil {
+			result["error"] = fmt.Sprintf("%v", r)
+		}
+	}()
+
+	getString := func(k string) string { v, _ := args[k].(string); return v }
+	getInt := func(k string) int {
+		if v, ok := args[k].(float64); ok {
+			return int(v)
+		}
+		if v, ok := args[k].(int); ok {
+			return v
+		}
+		return -1
+	}
+
+	switch name {
+	case "list_files":
+		var files []string
+		filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if info.IsDir() && (strings.HasPrefix(info.Name(), ".") || info.Name() == "node_modules" || info.Name() == "vendor" || info.Name() == "__pycache__") {
+				return filepath.SkipDir
+			}
+			if !info.IsDir() && !strings.HasPrefix(info.Name(), ".") {
+				files = append(files, path)
+			}
+			return nil
+		})
+		result["files"] = files
+
+	case "search_file":
+		filename := getString("filename")
+		query := strings.ToLower(getString("query"))
+		content, err := os.ReadFile(filename)
+		if err != nil {
+			result["error"] = "File not found: " + filename
+			break
+		}
+		lines := strings.Split(string(content), "\n")
+		var results []string
+		for i, line := range lines {
+			if strings.Contains(strings.ToLower(line), query) {
+				s := max(0, i-2)
+				e := min(len(lines)-1, i+2)
+				results = append(results, fmt.Sprintf("--- Match around line %d ---", i+1))
+				for j := s; j <= e; j++ {
+					results = append(results, fmt.Sprintf("%d | %s", j+1, lines[j]))
+				}
+			}
+		}
+		if len(results) == 0 {
+			result["error"] = fmt.Sprintf("No matches for '%s'", query)
+		} else {
+			result["matches"] = strings.Join(results, "\n")
+		}
+
+	case "read_file":
+		filename := getString("filename")
+		start := getInt("start_line")
+		end := getInt("end_line")
+
+		content, err := os.ReadFile(filename)
+		if err != nil {
+			result["error"] = "File not found: " + filename
+			break
+		}
+		lines := strings.Split(string(content), "\n")
+
+		if start < 1 {
+			start = 1
+		}
+		if end < 1 || end > len(lines) {
+			end = len(lines)
+		}
+		if start-1 >= end {
+			result["error"] = "Invalid line range"
+			break
+		}
+
+		var numbered []string
+		for i := start - 1; i < end; i++ {
+			numbered = append(numbered, fmt.Sprintf("%d | %s", i+1, lines[i]))
+		}
+		result["total_lines"] = len(lines)
+		result["range"] = fmt.Sprintf("%d-%d", start, end)
+		result["content"] = strings.Join(numbered, "\n")
+
+	case "write_file":
+		filename := getString("filename")
+		content := getString("content")
+
+		dir := filepath.Dir(filename)
+		if dir != "." && dir != "" {
+			os.MkdirAll(dir, 0755)
+		}
+
+		err := os.WriteFile(filename, []byte(content), 0644)
+		if err != nil {
+			result["error"] = err.Error()
+		} else {
+			result["success"] = true
+			result["bytes"] = len(content)
+		}
+
+	case "edit_lines":
+		filename := getString("filename")
+		startLine := getInt("start_line")
+		endLine := getInt("end_line")
+		replaceWith := getString("replace_with")
+
+		content, err := os.ReadFile(filename)
+		if err != nil {
+			result["error"] = "File not found: " + filename
+			break
+		}
+		lines := strings.Split(string(content), "\n")
+
+		if startLine < 1 || endLine < 1 {
+			result["error"] = "Invalid line numbers"
+			break
+		}
+		start := startLine - 1
+		end := endLine
+
+		if start > end || start >= len(lines) {
+			result["error"] = "Invalid range"
+			break
+		}
+		if end > len(lines) {
+			end = len(lines)
+		}
+
+		// Store old lines for diff
+		oldLines := lines[start:end]
+
+		originalIndent := ""
+		if start < len(lines) {
+			originalIndent = regexp.MustCompile(`^\s*`).FindString(lines[start])
+		}
+		replacementLines := strings.Split(replaceWith, "\n")
+
+		if len(originalIndent) > 0 && len(replacementLines) > 0 && !regexp.MustCompile(`^\s+`).MatchString(replacementLines[0]) {
+			for i, l := range replacementLines {
+				if strings.TrimSpace(l) != "" {
+					replacementLines[i] = originalIndent + l
+				}
+			}
+		}
+
+		newContent := append(lines[:start], append(replacementLines, lines[end:]...)...)
+		err = os.WriteFile(filename, []byte(strings.Join(newContent, "\n")), 0644)
+		if err != nil {
+			result["error"] = err.Error()
+		} else {
+			result["success"] = true
+			result["old_lines"] = oldLines
+			result["new_lines"] = replacementLines
+			result["start_line"] = startLine
+			result["filename"] = filename
+		}
+
+	case "shell":
+		command := getString("command")
+		if command == "" {
+			result["error"] = "No command provided"
+			break
+		}
+
+		dangerous := []string{"rm -rf /", "mkfs", "dd if=", ":(){", "fork bomb", "> /dev/sd"}
+		cmdLower := strings.ToLower(command)
+		for _, d := range dangerous {
+			if strings.Contains(cmdLower, d) {
+				result["error"] = "Command blocked for safety"
+				return result
+			}
+		}
+
+		var cmd *exec.Cmd
+		if runtime.GOOS == "windows" {
+			cmd = exec.Command("cmd", "/C", command)
+		} else {
+			cmd = exec.Command("sh", "-c", command)
+		}
+
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		cmd.Dir, _ = os.Getwd()
+
+		err := cmd.Run()
+
+		result["stdout"] = stdout.String()
+		result["stderr"] = stderr.String()
+		if err != nil {
+			result["exit_code"] = 1
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				result["exit_code"] = exitErr.ExitCode()
+			}
+		} else {
+			result["exit_code"] = 0
+			result["success"] = true
+		}
+
+	default:
+		result["error"] = "Unknown tool: " + name
+	}
+
+	return result
+}
+
+func runAI() {
+	maxIter := 25
+	p, ok := PROVIDERS[state.provider]
+	if !ok {
+		printError("Unknown provider")
+		return
+	}
+	cfg := state.configs[state.provider]
+
+	fullCfg := ProviderConfig{
+		APIKey:   cfg.APIKey,
+		Model:    cfg.Model,
+		Endpoint: cfg.Endpoint,
+	}
+	if fullCfg.Model == "" {
+		fullCfg.Model = p.DefaultModel
+	}
+	if fullCfg.Endpoint == "" {
+		fullCfg.Endpoint = p.DefaultEndpoint
+	}
+
+	for iter := 0; iter < maxIter; iter++ {
+		done := make(chan bool)
+		go printSpinner(done, "thinking...")
+
+		reqData := p.BuildRequest(state.history, fullCfg)
+
+		bodyBytes, _ := json.Marshal(reqData.Body)
+		req, _ := http.NewRequest("POST", reqData.URL, bytes.NewBuffer(bodyBytes))
+		for k, v := range reqData.Headers {
+			req.Header.Set(k, v)
+		}
+
+		client := &http.Client{Timeout: 120 * time.Second}
+		resp, err := client.Do(req)
+
+		done <- true
+		time.Sleep(50 * time.Millisecond)
+
+		if err != nil {
+			printError("Request failed: " + err.Error())
+			break
+		}
+
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		// Estimate tokens
+		state.tokens += len(string(respBody)) / 4
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			errMsg := string(respBody)
+			if len(errMsg) > 150 {
+				errMsg = errMsg[:150] + "..."
+			}
+			printError(fmt.Sprintf("API %d: %s", resp.StatusCode, errMsg))
+			break
+		}
+
+		var data map[string]interface{}
+		json.Unmarshal(respBody, &data)
+
+		content := parseAIResponse(data, string(respBody))
+
+		if content != "" {
+			var toolCmd map[string]interface{}
+			jsonStr := ""
+
+			toolMatch := regexp.MustCompile(`(?is)\x60\x60\x60(?:json)?\s*(\{[\s\S]*?\})\s*\x60\x60\x60`).FindStringSubmatch(content)
+			if len(toolMatch) > 1 {
+				jsonStr = toolMatch[1]
+			} else if strings.Contains(content, "\"tool\"") && strings.Contains(content, "{") && strings.Contains(content, "}") {
+				start := strings.Index(content, "{")
+				end := strings.LastIndex(content, "}")
+				if start > -1 && end > start {
+					jsonStr = content[start : end+1]
+				}
+			}
+
+			if jsonStr != "" {
+				err := json.Unmarshal([]byte(jsonStr), &toolCmd)
+				if err != nil {
+					toolCmd = make(map[string]interface{})
+					fmMatch := regexp.MustCompile(`"filename"\s*:\s*"([^"]+)"`).FindStringSubmatch(jsonStr)
+					filename := "file.txt"
+					if len(fmMatch) > 1 {
+						filename = fmMatch[1]
+					}
+
+					unescapeStr := func(str string) string {
+						str = strings.ReplaceAll(str, "\\n", "\n")
+						str = strings.ReplaceAll(str, "\\t", "\t")
+						str = strings.ReplaceAll(str, "\\\"", "\"")
+						str = strings.ReplaceAll(str, "\\\\", "\\")
+						return str
+					}
+
+					if strings.Contains(jsonStr, `"write_file"`) {
+						cIdx := strings.Index(jsonStr, `"content"`)
+						if cIdx > -1 {
+							sQ := strings.Index(jsonStr[cIdx+9:], `"`) + cIdx + 9
+							eQ := strings.LastIndex(jsonStr, `"`)
+							if sQ > -1 && eQ > sQ {
+								toolCmd = map[string]interface{}{"tool": "write_file", "args": map[string]interface{}{"filename": filename, "content": unescapeStr(jsonStr[sQ+1 : eQ])}}
+							}
+						}
+					} else if strings.Contains(jsonStr, `"edit_lines"`) {
+						slMatch := regexp.MustCompile(`"start_line"\s*:\s*(\d+)`).FindStringSubmatch(jsonStr)
+						elMatch := regexp.MustCompile(`"end_line"\s*:\s*(\d+)`).FindStringSubmatch(jsonStr)
+						rIdx := strings.Index(jsonStr, `"replace_with"`)
+						if len(slMatch) > 1 && len(elMatch) > 1 && rIdx > -1 {
+							sQ := strings.Index(jsonStr[rIdx+14:], `"`) + rIdx + 14
+							eQ := strings.LastIndex(jsonStr, `"`)
+							if sQ > -1 && eQ > sQ {
+								sl, _ := strconv.Atoi(slMatch[1])
+								el, _ := strconv.Atoi(elMatch[1])
+								toolCmd = map[string]interface{}{"tool": "edit_lines", "args": map[string]interface{}{"filename": filename, "start_line": sl, "end_line": el, "replace_with": unescapeStr(jsonStr[sQ+1 : eQ])}}
+							}
+						}
+					} else if strings.Contains(jsonStr, `"shell"`) {
+						cmdMatch := regexp.MustCompile(`"command"\s*:\s*"([^"]+)"`).FindStringSubmatch(jsonStr)
+						if len(cmdMatch) > 1 {
+							toolCmd = map[string]interface{}{"tool": "shell", "args": map[string]interface{}{"command": unescapeStr(cmdMatch[1])}}
+						}
+					} else if strings.Contains(jsonStr, `"search_file"`) {
+						qm := regexp.MustCompile(`"query"\s*:\s*"([^"]+)"`).FindStringSubmatch(jsonStr)
+						if len(qm) > 1 {
+							toolCmd = map[string]interface{}{"tool": "search_file", "args": map[string]interface{}{"filename": filename, "query": qm[1]}}
+						}
+					} else if strings.Contains(jsonStr, `"read_file"`) {
+						slMatch := regexp.MustCompile(`"start_line"\s*:\s*(\d+)`).FindStringSubmatch(jsonStr)
+						elMatch := regexp.MustCompile(`"end_line"\s*:\s*(\d+)`).FindStringSubmatch(jsonStr)
+						args := map[string]interface{}{"filename": filename}
+						if len(slMatch) > 1 {
+							sl, _ := strconv.Atoi(slMatch[1])
+							args["start_line"] = sl
+						}
+						if len(elMatch) > 1 {
+							el, _ := strconv.Atoi(elMatch[1])
+							args["end_line"] = el
+						}
+						toolCmd = map[string]interface{}{"tool": "read_file", "args": args}
+					} else if strings.Contains(jsonStr, `"list_files"`) {
+						toolCmd = map[string]interface{}{"tool": "list_files", "args": map[string]interface{}{}}
+					}
+				}
+			}
+
+			if toolCmd != nil && len(toolCmd) > 0 {
+				tName := ""
+				var tArgs interface{}
+
+				if name, ok := toolCmd["tool"].(string); ok {
+					tName = name
+				} else if name, ok := toolCmd["name"].(string); ok {
+					tName = name
+				} else if fn, ok := toolCmd["function"].(map[string]interface{}); ok {
+					tName, _ = fn["name"].(string)
+					tArgs = fn["arguments"]
+				} else if tcArr, ok := toolCmd["tool_calls"].([]interface{}); ok && len(tcArr) > 0 {
+					tc := tcArr[0].(map[string]interface{})
+					tName, _ = tc["name"].(string)
+					tArgs = tc["arguments"]
+				}
+
+				if tArgs == nil {
+					tArgs = toolCmd["args"]
+					if tArgs == nil {
+						tArgs = toolCmd["arguments"]
+					}
+				}
+
+				if tArgsStr, ok := tArgs.(string); ok {
+					var parsed map[string]interface{}
+					if json.Unmarshal([]byte(tArgsStr), &parsed) == nil {
+						tArgs = parsed
+					}
+				}
+
+				if tName != "" && tArgs != nil {
+					if argsMap, ok := tArgs.(map[string]interface{}); ok {
+						state.toolCalls++
+						result := runTool(tName, argsMap)
+
+						printToolCall(tName, argsMap, result)
+
+						// Show diff for edit_lines
+						if tName == "edit_lines" {
+							if oldLines, ok := result["old_lines"].([]string); ok {
+								if newLines, ok := result["new_lines"].([]string); ok {
+									if filename, ok := result["filename"].(string); ok {
+										if startLine, ok := result["start_line"].(int); ok {
+											printFileDiff(filename, oldLines, newLines, startLine)
+										}
+									}
+								}
+							}
+						}
+
+						resBytes, _ := json.Marshal(result)
+
+						state.history = append(state.history, Message{Role: "assistant", Content: content})
+						state.history = append(state.history, Message{Role: "user", Content: fmt.Sprintf(`Tool result: %s
+
+Continue if more work needed, or summarize what you did.`, string(resBytes))})
+						continue
+					}
+				}
+			}
+
+			printAssistantMessage(content)
+			state.history = append(state.history, Message{Role: "assistant", Content: content})
+		} else {
+			printError("Empty response from API")
+		}
+		break
+	}
+}
+
+func getSystemPrompt() string {
+	cwd, _ := os.Getwd()
+	return fmt.Sprintf(`You are Axiom, a skilled AI coding assistant. You help users by reading, writing, and editing code.
+
+WORKSPACE: %s
+OS: %s
+
+TOOLS (use JSON in code blocks):
+
+1. **list_files** - List all project files
+   ` + "```json" + `
+   {"tool": "list_files", "args": {}}
+   ` + "```" + `
+
+2. **read_file** - Read file contents (use line ranges for large files)
+   ` + "```json" + `
+   {"tool": "read_file", "args": {"filename": "main.go", "start_line": 1, "end_line": 50}}
+   ` + "```" + `
+
+3. **search_file** - Find text in a file
+   ` + "```json" + `
+   {"tool": "search_file", "args": {"filename": "main.go", "query": "func main"}}
+   ` + "```" + `
+
+4. **write_file** - Create/overwrite a file
+   ` + "```json" + `
+   {"tool": "write_file", "args": {"filename": "hello.py", "content": "print('Hello!')"}}
+   ` + "```" + `
+
+5. **edit_lines** - Edit specific lines (inclusive, 1-indexed)
+   ` + "```json" + `
+   {"tool": "edit_lines", "args": {"filename": "main.go", "start_line": 10, "end_line": 12, "replace_with": "newCode();"}}
+   ` + "```" + `
+
+6. **shell** - Run a shell command
+   ` + "```json" + `
+   {"tool": "shell", "args": {"command": "go run main.go"}}
+   ` + "```" + `
+
+GUIDELINES:
+• For casual chat: respond naturally without tools
+• For coding tasks: use appropriate tools, then explain what you did
+• For edits: use search_file first to find exact lines, then edit_lines
+• Always maintain proper indentation when editing
+• After completing work, give a brief summary`, cwd, runtime.GOOS)
+}
+
+func sendMessage(text string) {
+	if text == "" {
+		return
+	}
+	if !state.connected {
+		printError("No provider configured. Run /config")
+		return
+	}
+
+	state.cmdHistory = append(state.cmdHistory, text)
+
+	if len(state.history) == 0 {
+		state.history = append(state.history, Message{Role: "user", Content: "SYSTEM: " + getSystemPrompt()})
+		state.history = append(state.history, Message{Role: "assistant", Content: "Ready to help! I'll use tools for file operations and just chat otherwise."})
+	}
+
+	printUserMessage(text)
+	state.history = append(state.history, Message{Role: "user", Content: text})
+	runAI()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMMAND HANDLERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func handleConfig(reader *bufio.Reader) {
+	fmt.Println()
+	fmt.Printf("  %sPROVIDERS%s\n\n", Bold, Reset)
+	fmt.Printf("  %sCloud:%s    google openai anthropic mistral groq together openrouter\n", Dim, Reset)
+	fmt.Printf("  %sLocal:%s    ollama lmstudio llamacpp\n", Dim, Reset)
+	fmt.Printf("  %sCustom:%s   cloudflare custom\n", Dim, Reset)
+	fmt.Println()
+
+	fmt.Printf("  %sProvider%s [%s]: ", Bold, Reset, state.provider)
+	p, _ := reader.ReadString('\n')
+	p = strings.TrimSpace(p)
+	if p == "" {
+		p = state.provider
+	}
+
+	if _, ok := PROVIDERS[p]; !ok {
+		printError("Invalid provider: " + p)
+		return
+	}
+	state.provider = p
+	prov := PROVIDERS[p]
+	cfg := state.configs[p]
+
+	if prov.Type == "local" || prov.Type == "custom" {
+		defaultEp := prov.DefaultEndpoint
+		if cfg.Endpoint != "" {
+			defaultEp = cfg.Endpoint
+		}
+		fmt.Printf("  %sEndpoint%s [%s]: ", Bold, Reset, defaultEp)
+		ep, _ := reader.ReadString('\n')
+		ep = strings.TrimSpace(ep)
+		if ep != "" {
+			cfg.Endpoint = ep
+		} else if cfg.Endpoint == "" {
+			cfg.Endpoint = prov.DefaultEndpoint
+		}
+	}
+
+	if prov.Type != "local" || p == "ollama" {
+		keyHint := "not set"
+		if cfg.APIKey != "" {
+			keyHint = "****" + cfg.APIKey[max(0, len(cfg.APIKey)-4):]
+		}
+		fmt.Printf("  %sAPI Key%s [%s]: ", Bold, Reset, keyHint)
+		k, _ := reader.ReadString('\n')
+		k = strings.TrimSpace(k)
+		if k != "" {
+			cfg.APIKey = k
+		}
+	}
+
+	defaultModel := prov.DefaultModel
+	if cfg.Model != "" {
+		defaultModel = cfg.Model
+	}
+	fmt.Printf("  %sModel%s [%s]: ", Bold, Reset, defaultModel)
+	m, _ := reader.ReadString('\n')
+	m = strings.TrimSpace(m)
+	if m != "" {
+		cfg.Model = m
+	} else if cfg.Model == "" {
+		cfg.Model = prov.DefaultModel
+	}
+
+	state.configs[p] = cfg
+	state.connected = true
+
+	if err := saveConfig(); err != nil {
+		printError("Failed to save: " + err.Error())
+	} else {
+		printSuccess(fmt.Sprintf("Connected to %s (%s)", prov.Name, cfg.Model))
+	}
+}
+
+func handleModel(reader *bufio.Reader) {
+	if !state.connected {
+		printError("No provider configured")
+		return
+	}
+
+	prov := PROVIDERS[state.provider]
+	cfg := state.configs[state.provider]
+	current := cfg.Model
+	if current == "" {
+		current = prov.DefaultModel
+	}
+
+	fmt.Printf("\n  Current: %s%s%s\n", Cyan, current, Reset)
+	fmt.Printf("  %sNew model:%s ", Bold, Reset)
+	m, _ := reader.ReadString('\n')
+	m = strings.TrimSpace(m)
+
+	if m == "" {
+		return
+	}
+
+	cfg.Model = m
+	state.configs[state.provider] = cfg
+	saveConfig()
+	printSuccess("Model → " + m)
+}
+
+func handleClear() {
+	state.history = []Message{}
+	state.toolCalls = 0
+	state.tokens = 0
+	printSuccess("Conversation cleared")
+}
+
+func handleStatus() {
+	fmt.Println()
+
+	if !state.connected {
+		fmt.Printf("  %sStatus:%s %sDisconnected%s\n", Bold, Reset, Red, Reset)
+		fmt.Printf("  Run /config to connect\n")
+		return
+	}
+
+	prov := PROVIDERS[state.provider]
+	cfg := state.configs[state.provider]
+	model := cfg.Model
+	if model == "" {
+		model = prov.DefaultModel
+	}
+
+	cwd, _ := os.Getwd()
+	elapsed := time.Since(state.startTime).Truncate(time.Second)
+
+	fmt.Printf("  %sProvider%s   %s%s%s\n", Dim, Reset, Green, prov.Name, Reset)
+	fmt.Printf("  %sModel%s      %s\n", Dim, Reset, model)
+	fmt.Printf("  %sWorkspace%s  %s\n", Dim, Reset, cwd)
+	fmt.Printf("  %sSession%s    %s\n", Dim, Reset, elapsed)
+	fmt.Printf("  %sMessages%s   %d\n", Dim, Reset, len(state.history))
+	fmt.Printf("  %sTools%s      %d calls\n", Dim, Reset, state.toolCalls)
+	fmt.Printf("  %sTokens%s     ~%d\n", Dim, Reset, state.tokens)
+	fmt.Println()
+}
+
+func handleFiles() {
+	var files []string
+	filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() && (strings.HasPrefix(info.Name(), ".") || info.Name() == "node_modules" || info.Name() == "vendor" || info.Name() == "__pycache__") {
+			return filepath.SkipDir
+		}
+		if !info.IsDir() && !strings.HasPrefix(info.Name(), ".") {
+			files = append(files, path)
+		}
+		return nil
+	})
+
+	fmt.Printf("\n  %s%d files%s\n\n", Dim, len(files), Reset)
+
+	icons := map[string]string{
+		".go": "◆", ".js": "◇", ".ts": "◇", ".py": "○", ".rs": "●",
+		".md": "□", ".json": "◈", ".yaml": "◈", ".yml": "◈",
+		".html": "◎", ".css": "◎", ".sh": "▷",
+	}
+
+	for _, f := range files {
+		ext := filepath.Ext(f)
+		icon := "·"
+		if i, ok := icons[ext]; ok {
+			icon = i
+		}
+		fmt.Printf("  %s%s%s %s\n", Cyan, icon, Reset, f)
+	}
+	fmt.Println()
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func main() {
+	loadConfig()
+	reader := bufio.NewReader(os.Stdin)
+
+	printWelcome()
+
+	for {
+		printStatusBar()
+		fmt.Printf("%s❯%s ", Cyan, Reset)
+
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			break
+		}
+		input = strings.TrimSpace(input)
+
+		if input == "" {
+			continue
+		}
+
+		switch {
+		case input == "/exit", input == "/quit", input == "/q":
+			fmt.Println("\n  " + Dim + "Goodbye!" + Reset + "\n")
+			return
+		case input == "/help", input == "/?":
+			printHelp()
+		case input == "/config":
+			handleConfig(reader)
+		case input == "/model":
+			handleModel(reader)
+		case input == "/clear", input == "/reset":
+			handleClear()
+		case input == "/status":
+			handleStatus()
+		case input == "/files", input == "/ls":
+			handleFiles()
+		case strings.HasPrefix(input, "/"):
+			printError("Unknown command. Try /help")
+		default:
+			sendMessage(input)
+		}
+	}
+}
