@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,8 +16,12 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+// Global mutex to prevent background bot messages from colliding with CLI typing
+var aiMutex sync.Mutex
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ANSI STYLES
@@ -52,14 +58,14 @@ const (
 	ShowCursor = "\033[?25h"
 )
 
-// Syntax highlighting colors
+// Syntax highlighting colors (using standard ANSI for perfect terminal compatibility)
 const (
-	SynKeyword = "\033[38;5;198m" // Pink
-	SynString  = "\033[38;5;114m" // Green
-	SynNumber  = "\033[38;5;209m" // Orange
-	SynComment = "\033[38;5;242m" // Gray
-	SynFunc    = "\033[38;5;81m"  // Cyan
-	SynType    = "\033[38;5;81m"  // Cyan
+	SynKeyword = Magenta
+	SynString  = Green
+	SynNumber  = Yellow
+	SynComment = Gray
+	SynFunc    = Cyan
+	SynType    = Cyan
 )
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -90,14 +96,27 @@ type ProviderConfig struct {
 	Model    string `json:"model"`
 }
 
+type BotConfig struct {
+	TelegramToken    string `json:"telegram_token"`
+	DiscordAppID     string `json:"discord_app_id"`
+	DiscordPublicKey string `json:"discord_public_key"`
+	DiscordBotToken  string `json:"discord_bot_token"`
+	WhatsAppToken    string `json:"whatsapp_token"`
+	WhatsAppPhoneID  string `json:"whatsapp_phone_id"`
+	WhatsAppVerify   string `json:"whatsapp_verify"`
+	ServerPort       string `json:"server_port"`
+}
+
 type SavedConfig struct {
 	Provider string                    `json:"provider"`
 	Configs  map[string]ProviderConfig `json:"configs"`
+	Bots     BotConfig                 `json:"bots"`
 }
 
 var state = struct {
 	provider   string
 	configs    map[string]ProviderConfig
+	bots       BotConfig
 	connected  bool
 	history    []Message
 	cmdHistory []string
@@ -295,13 +314,227 @@ func loadConfig() error {
 			state.connected = true
 		}
 	}
+	state.bots = saved.Bots
 	return nil
 }
 
 func saveConfig() error {
 	os.MkdirAll(getConfigDir(), 0755)
-	data, _ := json.MarshalIndent(SavedConfig{Provider: state.provider, Configs: state.configs}, "", "  ")
+	data, _ := json.MarshalIndent(SavedConfig{Provider: state.provider, Configs: state.configs, Bots: state.bots}, "", "  ")
 	return os.WriteFile(getConfigPath(), data, 0600)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BOT INTEGRATIONS (TELEGRAM, DISCORD, WHATSAPP)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func StartBots() {
+	if state.bots.TelegramToken != "" {
+		go runTelegramPoller()
+	}
+	if state.bots.ServerPort != "" {
+		go startBotServer()
+	}
+}
+
+func runTelegramPoller() {
+	offset := 0
+	for {
+		url := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=20", state.bots.TelegramToken, offset)
+		resp, err := http.Get(url)
+		if err != nil {
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		var result struct {
+			Ok     bool `json:"ok"`
+			Result []struct {
+				UpdateID int `json:"update_id"`
+				Message  struct {
+					Chat struct {
+						ID int64 `json:"id"`
+					} `json:"chat"`
+					Text string `json:"text"`
+				} `json:"message"`
+			} `json:"result"`
+		}
+		json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
+
+		for _, u := range result.Result {
+			offset = max(offset, u.UpdateID+1)
+			if u.Message.Text != "" {
+				go sendMessageFromPlatform("telegram", fmt.Sprintf("%d", u.Message.Chat.ID), u.Message.Text)
+			}
+		}
+	}
+}
+
+func startBotServer() {
+	port := state.bots.ServerPort
+	if port == "" {
+		port = "8080"
+	}
+	http.HandleFunc("/discord", handleDiscordWebhook)
+	http.HandleFunc("/whatsapp", handleWhatsAppWebhook)
+	go http.ListenAndServe(":"+port, nil)
+}
+
+func handleDiscordWebhook(w http.ResponseWriter, r *http.Request) {
+	sigHex := r.Header.Get("X-Signature-Ed25519")
+	ts := r.Header.Get("X-Signature-Timestamp")
+
+	if sigHex == "" || ts == "" {
+		http.Error(w, "missing headers", 401)
+		return
+	}
+
+	body, _ := io.ReadAll(r.Body)
+	r.Body = io.NopCloser(bytes.NewBuffer(body))
+
+	pubKey, err1 := hex.DecodeString(state.bots.DiscordPublicKey)
+	sig, err2 := hex.DecodeString(sigHex)
+
+	if err1 != nil || err2 != nil || len(pubKey) != ed25519.PublicKeySize || len(sig) != ed25519.SignatureSize {
+		http.Error(w, "invalid crypto", 401)
+		return
+	}
+
+	msg := append([]byte(ts), body...)
+	if !ed25519.Verify(pubKey, msg, sig) {
+		http.Error(w, "invalid signature", 401)
+		return
+	}
+
+	var payload map[string]interface{}
+	json.Unmarshal(body, &payload)
+
+	if t, _ := payload["type"].(float64); t == 1 {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"type":1}`))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"type":5}`)) // Defer response
+
+	go func() {
+		token, _ := payload["token"].(string)
+		data, _ := payload["data"].(map[string]interface{})
+		options, _ := data["options"].([]interface{})
+		text := ""
+		if len(options) > 0 {
+			opt := options[0].(map[string]interface{})
+			text, _ = opt["value"].(string)
+		}
+		if text != "" {
+			sendMessageFromPlatform("discord", token, text)
+		}
+	}()
+}
+
+func handleWhatsAppWebhook(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "GET" {
+		q := r.URL.Query()
+		if q.Get("hub.verify_token") == state.bots.WhatsAppVerify {
+			w.Write([]byte(q.Get("hub.challenge")))
+		} else {
+			http.Error(w, "invalid verify token", 401)
+		}
+		return
+	}
+
+	var payload map[string]interface{}
+	json.NewDecoder(r.Body).Decode(&payload)
+
+	var text, from string
+	entries, _ := payload["entry"].([]interface{})
+	if len(entries) > 0 {
+		if entry, ok := entries[0].(map[string]interface{}); ok {
+			if changes, _ := entry["changes"].([]interface{}); len(changes) > 0 {
+				if change, ok := changes[0].(map[string]interface{}); ok {
+					if val, ok := change["value"].(map[string]interface{}); ok {
+						if msgs, _ := val["messages"].([]interface{}); len(msgs) > 0 {
+							if msg, ok := msgs[0].(map[string]interface{}); ok {
+								from, _ = msg["from"].(string)
+								if txtObj, ok := msg["text"].(map[string]interface{}); ok {
+									text, _ = txtObj["body"].(string)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if text != "" && from != "" {
+		go sendMessageFromPlatform("whatsapp", from, text)
+	}
+	w.WriteHeader(200)
+}
+
+func sendPlatformReply(platform, chatID, text string) {
+	if len(text) > 2000 {
+		text = text[:1996] + "..." // Truncate safely
+	}
+
+	switch platform {
+	case "telegram":
+		url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", state.bots.TelegramToken)
+		payload := map[string]interface{}{"chat_id": chatID, "text": text}
+		b, _ := json.Marshal(payload)
+		http.Post(url, "application/json", bytes.NewBuffer(b))
+
+	case "whatsapp":
+		url := fmt.Sprintf("https://graph.facebook.com/v17.0/%s/messages", state.bots.WhatsAppPhoneID)
+		payload := map[string]interface{}{
+			"messaging_product": "whatsapp",
+			"to":                chatID,
+			"type":              "text",
+			"text":              map[string]string{"body": text},
+		}
+		b, _ := json.Marshal(payload)
+		req, _ := http.NewRequest("POST", url, bytes.NewBuffer(b))
+		req.Header.Set("Authorization", "Bearer "+state.bots.WhatsAppToken)
+		req.Header.Set("Content-Type", "application/json")
+		http.DefaultClient.Do(req)
+
+	case "discord":
+		var url string
+		var req *http.Request
+		if len(chatID) > 30 {
+			url = fmt.Sprintf("https://discord.com/api/v10/webhooks/%s/%s/messages/@original", state.bots.DiscordAppID, chatID)
+			payload := map[string]interface{}{"content": text}
+			b, _ := json.Marshal(payload)
+			req, _ = http.NewRequest("PATCH", url, bytes.NewBuffer(b))
+		} else {
+			url = fmt.Sprintf("https://discord.com/api/v10/channels/%s/messages", chatID)
+			payload := map[string]interface{}{"content": text}
+			b, _ := json.Marshal(payload)
+			req, _ = http.NewRequest("POST", url, bytes.NewBuffer(b))
+			req.Header.Set("Authorization", "Bot "+state.bots.DiscordBotToken)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		http.DefaultClient.Do(req)
+	}
+}
+
+func sendMessageFromPlatform(platform, chatID, text string) {
+	aiMutex.Lock()
+	defer aiMutex.Unlock()
+
+	fmt.Printf("\r%s\n  %s %s[%s]%s %s\n", ClearLine, Cyan, White, platform, Reset, text)
+
+	if len(state.history) == 0 {
+		state.history = append(state.history, Message{Role: "user", Content: "SYSTEM: " + getSystemPrompt()})
+		state.history = append(state.history, Message{Role: "assistant", Content: "Ready!"})
+	}
+
+	state.history = append(state.history, Message{Role: "user", Content: text})
+	runAI(platform, chatID)
+
+	fmt.Printf("%s❯%s ", Cyan, Reset)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -313,7 +546,7 @@ func clearScreen() {
 }
 
 func getTermWidth() int {
-	return 80 // Default, could use terminal size detection
+	return 80 // Default
 }
 
 func stripAnsi(s string) string {
@@ -321,9 +554,7 @@ func stripAnsi(s string) string {
 	return re.ReplaceAllString(s, "")
 }
 
-// Render markdown-style formatting
 func renderMarkdown(text string) string {
-	// Code blocks first (to protect them from other formatting)
 	codeBlockRe := regexp.MustCompile("(?s)```(\\w*)\\n(.*?)```")
 	text = codeBlockRe.ReplaceAllStringFunc(text, func(match string) string {
 		parts := codeBlockRe.FindStringSubmatch(match)
@@ -332,34 +563,61 @@ func renderMarkdown(text string) string {
 		return renderCodeBlock(code, lang)
 	})
 
-	// Inline code
 	inlineCodeRe := regexp.MustCompile("`([^`]+)`")
 	text = inlineCodeRe.ReplaceAllString(text, BgDarkGray+Cyan+"$1"+Reset)
 
-	// Bold
 	boldRe := regexp.MustCompile(`\*\*([^*]+)\*\*`)
 	text = boldRe.ReplaceAllString(text, Bold+"$1"+Reset)
 
-	// Italic
 	italicRe := regexp.MustCompile(`\*([^*]+)\*`)
 	text = italicRe.ReplaceAllString(text, Italic+"$1"+Reset)
 
-	// Headers
-	h1Re := regexp.MustCompile(`(?m)^# (.+)$`)
-	text = h1Re.ReplaceAllString(text, Bold+Cyan+"$1"+Reset)
-
-	h2Re := regexp.MustCompile(`(?m)^## (.+)$`)
-	text = h2Re.ReplaceAllString(text, Bold+"$1"+Reset)
-
-	// Bullet points
 	bulletRe := regexp.MustCompile(`(?m)^(\s*)[-*] (.+)$`)
 	text = bulletRe.ReplaceAllString(text, "$1"+Cyan+"•"+Reset+" $2")
 
-	// Numbered lists
 	numRe := regexp.MustCompile(`(?m)^(\s*)(\d+)\. (.+)$`)
 	text = numRe.ReplaceAllString(text, "$1"+Cyan+"$2."+Reset+" $3")
 
 	return text
+}
+
+func highlightSyntax(line, lang string) string {
+	if lang == "" {
+		return line
+	}
+
+	keywords := map[string][]string{
+		"go":     {"func", "package", "import", "return", "if", "else", "for", "range", "var", "const", "type", "struct", "interface", "map", "chan", "go", "defer", "select", "case", "default", "break", "continue", "switch", "nil", "true", "false"},
+		"js":     {"function", "const", "let", "var", "return", "if", "else", "for", "while", "class", "extends", "import", "export", "default", "async", "await", "try", "catch", "throw", "new", "this", "null", "undefined", "true", "false"},
+		"python": {"def", "class", "import", "from", "return", "if", "elif", "else", "for", "while", "try", "except", "raise", "with", "as", "None", "True", "False", "and", "or", "not", "in", "is", "lambda", "yield", "async", "await"},
+		"rust":   {"fn", "let", "mut", "const", "if", "else", "for", "while", "loop", "match", "struct", "enum", "impl", "trait", "pub", "use", "mod", "return", "self", "Self", "true", "false", "None", "Some", "Ok", "Err"},
+	}
+
+	result := line
+
+	if strings.Contains(line, "//") {
+		idx := strings.Index(line, "//")
+		result = line[:idx] + SynComment + line[idx:] + Reset
+		return result
+	}
+	if strings.HasPrefix(strings.TrimSpace(line), "#") && lang == "python" {
+		return SynComment + line + Reset
+	}
+
+	stringRe := regexp.MustCompile(`"[^"]*"|'[^']*'` + "`[^`]*`")
+	result = stringRe.ReplaceAllString(result, SynString+"$0"+Reset)
+
+	numRe := regexp.MustCompile(`\b(\d+\.?\d*)\b`)
+	result = numRe.ReplaceAllString(result, SynNumber+"$1"+Reset)
+
+	if kws, ok := keywords[lang]; ok {
+		for _, kw := range kws {
+			kwRe := regexp.MustCompile(`\b(` + kw + `)\b`)
+			result = kwRe.ReplaceAllString(result, SynKeyword+"$1"+Reset)
+		}
+	}
+
+	return result
 }
 
 func renderCodeBlock(code, lang string) string {
@@ -381,60 +639,13 @@ func renderCodeBlock(code, lang string) string {
 	return result.String()
 }
 
-func highlightSyntax(line, lang string) string {
-	if lang == "" {
-		return line
-	}
-
-	keywords := map[string][]string{
-		"go":     {"func", "package", "import", "return", "if", "else", "for", "range", "var", "const", "type", "struct", "interface", "map", "chan", "go", "defer", "select", "case", "default", "break", "continue", "switch", "nil", "true", "false"},
-		"js":     {"function", "const", "let", "var", "return", "if", "else", "for", "while", "class", "extends", "import", "export", "default", "async", "await", "try", "catch", "throw", "new", "this", "null", "undefined", "true", "false"},
-		"python": {"def", "class", "import", "from", "return", "if", "elif", "else", "for", "while", "try", "except", "raise", "with", "as", "None", "True", "False", "and", "or", "not", "in", "is", "lambda", "yield", "async", "await"},
-		"rust":   {"fn", "let", "mut", "const", "if", "else", "for", "while", "loop", "match", "struct", "enum", "impl", "trait", "pub", "use", "mod", "return", "self", "Self", "true", "false", "None", "Some", "Ok", "Err"},
-	}
-
-	result := line
-
-	// Comments
-	if strings.Contains(line, "//") {
-		idx := strings.Index(line, "//")
-		result = line[:idx] + SynComment + line[idx:] + Reset
-		return result
-	}
-	if strings.HasPrefix(strings.TrimSpace(line), "#") && lang == "python" {
-		return SynComment + line + Reset
-	}
-
-	// Strings
-	stringRe := regexp.MustCompile(`"[^"]*"|'[^']*'` + "`[^`]*`")
-	result = stringRe.ReplaceAllString(result, SynString+"$0"+Reset)
-
-	// Numbers
-	numRe := regexp.MustCompile(`\b(\d+\.?\d*)\b`)
-	result = numRe.ReplaceAllString(result, SynNumber+"$1"+Reset)
-
-	// Keywords
-	if kws, ok := keywords[lang]; ok {
-		for _, kw := range kws {
-			kwRe := regexp.MustCompile(`\b(` + kw + `)\b`)
-			result = kwRe.ReplaceAllString(result, SynKeyword+"$1"+Reset)
-		}
-	}
-
-	return result
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// UI OUTPUT FUNCTIONS
-// ═══════════════════════════════════════════════════════════════════════════════
-
 func printLogo() {
 	logo := `
    ` + Cyan + Bold + `▄▀▄ ▀▄▀ █ ▄▀▄ █▄ ▄█` + Reset + `
    ` + Cyan + `█▀█ ▄▀▄ █ ▀▄▀ █ ▀ █` + Reset + `
 `
 	fmt.Print(logo)
-	fmt.Println(Gray + "   AI-Powered Code Editor" + Reset)
+	fmt.Println(Gray + "   AI-Powered Code Editor & Bot" + Reset)
 	fmt.Println()
 }
 
@@ -464,7 +675,6 @@ func printStatusBar() {
 
 	elapsed := time.Since(state.startTime).Truncate(time.Second)
 
-	// Build status items
 	left := fmt.Sprintf(" %s%s%s", Cyan, cwd, Reset)
 	
 	right := fmt.Sprintf("%s%s●%s %s", providerColor, Bold, Reset, providerName)
@@ -491,8 +701,43 @@ func printDivider() {
 	fmt.Println(Gray + strings.Repeat("─", getTermWidth()) + Reset)
 }
 
+func printFileDiff(filename string, oldLines, newLines []string, startLine int) {
+	fmt.Printf("\n  %s%s─── %s%s\n", Gray, Bold, filename, Reset)
+	maxOld := 3
+	maxNew := 5
+
+	shown := 0
+	for i, line := range oldLines {
+		if shown >= maxOld {
+			fmt.Printf("  %s- ... +%d lines removed%s\n", Red+Dim, len(oldLines)-maxOld, Reset)
+			break
+		}
+		lineNum := startLine + i
+		displayLine := line
+		if len(displayLine) > 60 {
+			displayLine = displayLine[:57] + "..."
+		}
+		fmt.Printf("  %s%d │- %s%s\n", Red+Dim, lineNum, displayLine, Reset)
+		shown++
+	}
+
+	shown = 0
+	for i, line := range newLines {
+		if shown >= maxNew {
+			fmt.Printf("  %s+ ... +%d lines added%s\n", Green+Dim, len(newLines)-maxNew, Reset)
+			break
+		}
+		lineNum := startLine + i
+		displayLine := line
+		if len(displayLine) > 60 {
+			displayLine = displayLine[:57] + "..."
+		}
+		fmt.Printf("  %s%d │+ %s%s\n", Green, lineNum, displayLine, Reset)
+		shown++
+	}
+}
+
 func printToolCall(name string, args map[string]interface{}, result map[string]interface{}) {
-	// Icon based on tool
 	icon := "●"
 	color := Yellow
 	switch name {
@@ -514,12 +759,13 @@ func printToolCall(name string, args map[string]interface{}, result map[string]i
 	case "shell":
 		icon = "▶"
 		color = Yellow
+	case "send_message":
+		icon = "✉"
+		color = Magenta
 	}
 
-	// Compact output
 	fmt.Printf("\n  %s%s%s %s%s%s", color, icon, Reset, Bold, name, Reset)
 
-	// Show key args inline
 	if filename, ok := args["filename"].(string); ok {
 		fmt.Printf(" %s%s%s", Gray, filename, Reset)
 	}
@@ -531,7 +777,6 @@ func printToolCall(name string, args map[string]interface{}, result map[string]i
 		fmt.Printf(" %s%s%s", Gray, displayCmd, Reset)
 	}
 
-	// Result indicator
 	if _, ok := result["error"]; ok {
 		errMsg, _ := result["error"].(string)
 		if len(errMsg) > 50 {
@@ -542,6 +787,13 @@ func printToolCall(name string, args map[string]interface{}, result map[string]i
 		fmt.Printf(" %s✓%s\n", Green, Reset)
 	} else if files, ok := result["files"].([]string); ok {
 		fmt.Printf(" %s→ %d files%s\n", Gray, len(files), Reset)
+		for i, f := range files {
+			if i >= 5 {
+				fmt.Printf("    %s... +%d more%s\n", Dim, len(files)-5, Reset)
+				break
+			}
+			fmt.Printf("    %s%s%s\n", Dim, f, Reset)
+		}
 	} else if content, ok := result["content"].(string); ok {
 		lines := strings.Split(content, "\n")
 		fmt.Printf(" %s→ %d lines%s\n", Gray, len(lines), Reset)
@@ -555,7 +807,6 @@ func printToolCall(name string, args map[string]interface{}, result map[string]i
 		} else {
 			lines := strings.Split(stdout, "\n")
 			fmt.Printf(" %s→ %d lines output%s\n", Gray, len(lines), Reset)
-			// Show first 3 lines
 			for i, line := range lines {
 				if i >= 3 {
 					fmt.Printf("    %s... +%d more%s\n", Dim, len(lines)-3, Reset)
@@ -572,61 +823,15 @@ func printToolCall(name string, args map[string]interface{}, result map[string]i
 	}
 }
 
-func printFileDiff(filename string, oldLines, newLines []string, startLine int) {
-	fmt.Printf("\n  %s%s─── %s%s\n", Gray, Bold, filename, Reset)
-
-	maxOld := 3
-	maxNew := 5
-
-	// Show removed lines (old)
-	shown := 0
-	for i, line := range oldLines {
-		if shown >= maxOld {
-			fmt.Printf("  %s- ... +%d lines removed%s\n", Red+Dim, len(oldLines)-maxOld, Reset)
-			break
-		}
-		lineNum := startLine + i
-		displayLine := line
-		if len(displayLine) > 60 {
-			displayLine = displayLine[:57] + "..."
-		}
-		fmt.Printf("  %s%d │- %s%s\n", Red+Dim, lineNum, displayLine, Reset)
-		shown++
-	}
-
-	// Show added lines (new)
-	shown = 0
-	for i, line := range newLines {
-		if shown >= maxNew {
-			fmt.Printf("  %s+ ... +%d lines added%s\n", Green+Dim, len(newLines)-maxNew, Reset)
-			break
-		}
-		lineNum := startLine + i
-		displayLine := line
-		if len(displayLine) > 60 {
-			displayLine = displayLine[:57] + "..."
-		}
-		fmt.Printf("  %s%d │+ %s%s\n", Green, lineNum, displayLine, Reset)
-		shown++
-	}
-}
-
 func printAssistantMessage(content string) {
 	fmt.Println()
-
-	// Process markdown
 	rendered := renderMarkdown(content)
-
-	// Word wrap and print
 	lines := strings.Split(rendered, "\n")
 	for _, line := range lines {
-		// Handle code blocks (already formatted)
 		if strings.HasPrefix(strings.TrimSpace(line), "│") || strings.HasPrefix(strings.TrimSpace(line), "┌") || strings.HasPrefix(strings.TrimSpace(line), "└") {
 			fmt.Println(line)
 			continue
 		}
-
-		// Word wrap regular text at ~75 chars
 		if len(stripAnsi(line)) > 75 {
 			words := strings.Fields(line)
 			current := ""
@@ -666,10 +871,6 @@ func printSuccess(msg string) {
 	fmt.Printf("\n  %s✓%s %s\n", Green, Reset, msg)
 }
 
-func printInfo(msg string) {
-	fmt.Printf("\n  %sℹ%s %s\n", Blue, Reset, msg)
-}
-
 func printSpinner(done chan bool, message string) {
 	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	i := 0
@@ -687,57 +888,11 @@ func printSpinner(done chan bool, message string) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// HELP & WELCOME
-// ═══════════════════════════════════════════════════════════════════════════════
-
-func printWelcome() {
-	clearScreen()
-	printLogo()
-
-	if state.connected {
-		p := PROVIDERS[state.provider]
-		cfg := state.configs[state.provider]
-		model := cfg.Model
-		if model == "" {
-			model = p.DefaultModel
-		}
-		fmt.Printf("  %sConnected to %s%s%s using %s%s%s\n", Dim, Reset+Green, p.Name, Reset+Dim, Reset+Cyan, model, Reset)
-	} else {
-		fmt.Printf("  %sNo provider configured. Type %s/config%s to get started.%s\n", Dim, Yellow, Dim, Reset)
-	}
-
-	fmt.Println()
-	printDivider()
-}
-
-func printHelp() {
-	fmt.Println()
-	fmt.Printf("  %s%sCOMMANDS%s\n\n", Bold, Cyan, Reset)
-
-	commands := [][]string{
-		{"/config", "Configure AI provider"},
-		{"/model", "Change model"},
-		{"/clear", "Clear conversation"},
-		{"/status", "Show session info"},
-		{"/files", "List project files"},
-		{"/help", "Show this help"},
-		{"/exit", "Exit Axiom"},
-	}
-
-	for _, cmd := range commands {
-		fmt.Printf("  %s%-12s%s %s\n", Yellow, cmd[0], Reset, Dim+cmd[1]+Reset)
-	}
-
-	fmt.Println()
-	fmt.Printf("  %sJust type naturally to chat or request code changes.%s\n", Dim, Reset)
-	fmt.Println()
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// CORE AI LOGIC (preserved from original)
+// CORE AI LOGIC
 // ═══════════════════════════════════════════════════════════════════════════════
 
 func parseAIResponse(data map[string]interface{}, rawString string) string {
+	// Root-level handling for Cloudflare / Custom providers that wrap things deeply
 	if result, ok := data["result"].(map[string]interface{}); ok {
 		if _, hasChoices := result["choices"]; hasChoices {
 			data = result
@@ -746,9 +901,12 @@ func parseAIResponse(data map[string]interface{}, rawString string) string {
 		}
 	}
 
+	// OpenAI / Standard Format
 	if choices, ok := data["choices"].([]interface{}); ok && len(choices) > 0 {
 		choice := choices[0].(map[string]interface{})
 		if message, ok := choice["message"].(map[string]interface{}); ok {
+			
+			// Tool calls logic
 			if toolCalls, ok := message["tool_calls"].([]interface{}); ok && len(toolCalls) > 0 {
 				tc := toolCalls[0].(map[string]interface{})
 				funcObj, hasFunc := tc["function"].(map[string]interface{})
@@ -784,6 +942,7 @@ func parseAIResponse(data map[string]interface{}, rawString string) string {
 		}
 	}
 
+	// Gemini Format
 	if cands, ok := data["candidates"].([]interface{}); ok && len(cands) > 0 {
 		if content, ok := cands[0].(map[string]interface{})["content"].(map[string]interface{}); ok {
 			if parts, ok := content["parts"].([]interface{}); ok && len(parts) > 0 {
@@ -794,6 +953,7 @@ func parseAIResponse(data map[string]interface{}, rawString string) string {
 		}
 	}
 
+	// Root level fallbacks (crucial for Cloudflare's raw response models)
 	if resp, ok := data["response"].(string); ok {
 		return resp
 	}
@@ -820,6 +980,11 @@ func runTool(name string, args map[string]interface{}) map[string]interface{} {
 		if v, ok := args[k].(int); ok {
 			return v
 		}
+		if v, ok := args[k].(string); ok {
+			if i, err := strconv.Atoi(v); err == nil {
+				return i
+			}
+		}
 		return -1
 	}
 
@@ -830,7 +995,7 @@ func runTool(name string, args map[string]interface{}) map[string]interface{} {
 			if err != nil {
 				return nil
 			}
-			if info.IsDir() && (strings.HasPrefix(info.Name(), ".") || info.Name() == "node_modules" || info.Name() == "vendor" || info.Name() == "__pycache__") {
+			if info.IsDir() && info.Name() != "." && (strings.HasPrefix(info.Name(), ".") || info.Name() == "node_modules" || info.Name() == "vendor" || info.Name() == "__pycache__") {
 				return filepath.SkipDir
 			}
 			if !info.IsDir() && !strings.HasPrefix(info.Name(), ".") {
@@ -942,9 +1107,7 @@ func runTool(name string, args map[string]interface{}) map[string]interface{} {
 			end = len(lines)
 		}
 
-		// Store old lines for diff
 		oldLines := lines[start:end]
-
 		originalIndent := ""
 		if start < len(lines) {
 			originalIndent = regexp.MustCompile(`^\s*`).FindString(lines[start])
@@ -978,15 +1141,6 @@ func runTool(name string, args map[string]interface{}) map[string]interface{} {
 			break
 		}
 
-		dangerous := []string{"rm -rf /", "mkfs", "dd if=", ":(){", "fork bomb", "> /dev/sd"}
-		cmdLower := strings.ToLower(command)
-		for _, d := range dangerous {
-			if strings.Contains(cmdLower, d) {
-				result["error"] = "Command blocked for safety"
-				return result
-			}
-		}
-
 		var cmd *exec.Cmd
 		if runtime.GOOS == "windows" {
 			cmd = exec.Command("cmd", "/C", command)
@@ -1013,6 +1167,18 @@ func runTool(name string, args map[string]interface{}) map[string]interface{} {
 			result["success"] = true
 		}
 
+	case "send_message":
+		platform := getString("platform")
+		chatID := getString("chat_id")
+		text := getString("text")
+		if platform != "" && chatID != "" && text != "" {
+			sendPlatformReply(platform, chatID, text)
+			result["success"] = true
+			result["delivered_to"] = platform
+		} else {
+			result["error"] = "Missing parameters"
+		}
+
 	default:
 		result["error"] = "Unknown tool: " + name
 	}
@@ -1020,7 +1186,7 @@ func runTool(name string, args map[string]interface{}) map[string]interface{} {
 	return result
 }
 
-func runAI() {
+func runAI(source string, chatID string) {
 	maxIter := 25
 	p, ok := PROVIDERS[state.provider]
 	if !ok {
@@ -1067,7 +1233,6 @@ func runAI() {
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
-		// Estimate tokens
 		state.tokens += len(string(respBody)) / 4
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -1111,9 +1276,7 @@ func runAI() {
 
 					unescapeStr := func(str string) string {
 						str = strings.ReplaceAll(str, "\\n", "\n")
-						str = strings.ReplaceAll(str, "\\t", "\t")
 						str = strings.ReplaceAll(str, "\\\"", "\"")
-						str = strings.ReplaceAll(str, "\\\\", "\\")
 						return str
 					}
 
@@ -1169,44 +1332,22 @@ func runAI() {
 			}
 
 			if toolCmd != nil && len(toolCmd) > 0 {
-				tName := ""
-				var tArgs interface{}
-
-				if name, ok := toolCmd["tool"].(string); ok {
-					tName = name
-				} else if name, ok := toolCmd["name"].(string); ok {
-					tName = name
-				} else if fn, ok := toolCmd["function"].(map[string]interface{}); ok {
-					tName, _ = fn["name"].(string)
-					tArgs = fn["arguments"]
-				} else if tcArr, ok := toolCmd["tool_calls"].([]interface{}); ok && len(tcArr) > 0 {
-					tc := tcArr[0].(map[string]interface{})
-					tName, _ = tc["name"].(string)
-					tArgs = tc["arguments"]
+				tName, _ := toolCmd["tool"].(string)
+				if tName == "" {
+					tName, _ = toolCmd["name"].(string)
 				}
-
+				
+				var tArgs interface{} = toolCmd["args"]
 				if tArgs == nil {
-					tArgs = toolCmd["args"]
-					if tArgs == nil {
-						tArgs = toolCmd["arguments"]
-					}
-				}
-
-				if tArgsStr, ok := tArgs.(string); ok {
-					var parsed map[string]interface{}
-					if json.Unmarshal([]byte(tArgsStr), &parsed) == nil {
-						tArgs = parsed
-					}
+					tArgs = toolCmd["arguments"]
 				}
 
 				if tName != "" && tArgs != nil {
 					if argsMap, ok := tArgs.(map[string]interface{}); ok {
 						state.toolCalls++
 						result := runTool(tName, argsMap)
-
 						printToolCall(tName, argsMap, result)
 
-						// Show diff for edit_lines
 						if tName == "edit_lines" {
 							if oldLines, ok := result["old_lines"].([]string); ok {
 								if newLines, ok := result["new_lines"].([]string); ok {
@@ -1220,7 +1361,6 @@ func runAI() {
 						}
 
 						resBytes, _ := json.Marshal(result)
-
 						state.history = append(state.history, Message{Role: "assistant", Content: content})
 						state.history = append(state.history, Message{Role: "user", Content: fmt.Sprintf(`Tool result: %s
 
@@ -1232,6 +1372,10 @@ Continue if more work needed, or summarize what you did.`, string(resBytes))})
 
 			printAssistantMessage(content)
 			state.history = append(state.history, Message{Role: "assistant", Content: content})
+
+			if source != "cli" && chatID != "" {
+				sendPlatformReply(source, chatID, content)
+			}
 		} else {
 			printError("Empty response from API")
 		}
@@ -1239,51 +1383,36 @@ Continue if more work needed, or summarize what you did.`, string(resBytes))})
 	}
 }
 
+
 func getSystemPrompt() string {
 	cwd, _ := os.Getwd()
-	return fmt.Sprintf(`You are Axiom, a skilled AI coding assistant. You help users by reading, writing, and editing code.
-
+	return fmt.Sprintf(`You are Axiom, an elite, highly capable AI agent.
 WORKSPACE: %s
 OS: %s
 
-TOOLS (use JSON in code blocks):
+CRITICAL DIRECTIVES:
+1. YOU HAVE FULL INTERNET ACCESS. The 'shell' tool executes directly on the user's host machine.
+2. If the user asks for live data (prices, weather, etc.), DO NOT REFUSE. Immediately use the 'shell' tool with 'curl', 'wget', or a python script to fetch the data.
+3. DO NOT claim you are in a sandbox. DO NOT claim you cannot access the internet.
+4. DO NOT ask for permission to run commands. Just run them.
+5. NO YAPPING. Keep your responses brutally concise and direct.
 
-1. **list_files** - List all project files
-   ` + "```json" + `
-   {"tool": "list_files", "args": {}}
-   ` + "```" + `
+TOOLS (respond with JSON in code blocks):
 
-2. **read_file** - Read file contents (use line ranges for large files)
-   ` + "```json" + `
-   {"tool": "read_file", "args": {"filename": "main.go", "start_line": 1, "end_line": 50}}
-   ` + "```" + `
-
-3. **search_file** - Find text in a file
-   ` + "```json" + `
-   {"tool": "search_file", "args": {"filename": "main.go", "query": "func main"}}
-   ` + "```" + `
-
-4. **write_file** - Create/overwrite a file
-   ` + "```json" + `
-   {"tool": "write_file", "args": {"filename": "hello.py", "content": "print('Hello!')"}}
-   ` + "```" + `
-
-5. **edit_lines** - Edit specific lines (inclusive, 1-indexed)
-   ` + "```json" + `
-   {"tool": "edit_lines", "args": {"filename": "main.go", "start_line": 10, "end_line": 12, "replace_with": "newCode();"}}
-   ` + "```" + `
-
-6. **shell** - Run a shell command
-   ` + "```json" + `
-   {"tool": "shell", "args": {"command": "go run main.go"}}
-   ` + "```" + `
-
-GUIDELINES:
-• For casual chat: respond naturally without tools
-• For coding tasks: use appropriate tools, then explain what you did
-• For edits: use search_file first to find exact lines, then edit_lines
-• Always maintain proper indentation when editing
-• After completing work, give a brief summary`, cwd, runtime.GOOS)
+1. **list_files**
+   `+"```json\n"+`{"tool": "list_files", "args": {}}`+"\n```"+`
+2. **read_file**
+   `+"```json\n"+`{"tool": "read_file", "args": {"filename": "main.go", "start_line": 1, "end_line": 50}}`+"\n```"+`
+3. **search_file**
+   `+"```json\n"+`{"tool": "search_file", "args": {"filename": "main.go", "query": "func main"}}`+"\n```"+`
+4. **write_file**
+   `+"```json\n"+`{"tool": "write_file", "args": {"filename": "hello.py", "content": "print('hi')"}}`+"\n```"+`
+5. **edit_lines** (inclusive, 1-indexed)
+   `+"```json\n"+`{"tool": "edit_lines", "args": {"filename": "main.go", "start_line": 10, "end_line": 12, "replace_with": "newCode();"}}`+"\n```"+`
+6. **shell**
+   `+"```json\n"+`{"tool": "shell", "args": {"command": "curl -s 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd'"}}`+"\n```"+`
+7. **send_message** (Proactively message user on telegram/whatsapp/discord when a long task is finished)
+   `+"```json\n"+`{"tool": "send_message", "args": {"platform": "telegram", "chat_id": "123", "text": "I finished the deployment!"}}`+"\n```", cwd, runtime.GOOS)
 }
 
 func sendMessage(text string) {
@@ -1295,16 +1424,19 @@ func sendMessage(text string) {
 		return
 	}
 
+	aiMutex.Lock()
+	defer aiMutex.Unlock()
+
 	state.cmdHistory = append(state.cmdHistory, text)
 
 	if len(state.history) == 0 {
 		state.history = append(state.history, Message{Role: "user", Content: "SYSTEM: " + getSystemPrompt()})
-		state.history = append(state.history, Message{Role: "assistant", Content: "Ready to help! I'll use tools for file operations and just chat otherwise."})
+		state.history = append(state.history, Message{Role: "assistant", Content: "Ready!"})
 	}
 
 	printUserMessage(text)
 	state.history = append(state.history, Message{Role: "user", Content: text})
-	runAI()
+	runAI("cli", "")
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1377,20 +1509,45 @@ func handleConfig(reader *bufio.Reader) {
 
 	state.configs[p] = cfg
 	state.connected = true
+	saveConfig()
+	printSuccess(fmt.Sprintf("Connected to %s (%s)", prov.Name, cfg.Model))
+}
 
-	if err := saveConfig(); err != nil {
-		printError("Failed to save: " + err.Error())
-	} else {
-		printSuccess(fmt.Sprintf("Connected to %s (%s)", prov.Name, cfg.Model))
+func handleBots(reader *bufio.Reader) {
+	fmt.Println("\n  " + Bold + "BOT INTEGRATIONS" + Reset)
+	fmt.Println("  " + Dim + "Leave blank to keep current, type 'none' to clear." + Reset + "\n")
+
+	ask := func(label, current string) string {
+		display := current
+		if display != "" {
+			display = "********" + display[max(0, len(display)-4):]
+		}
+		fmt.Printf("  %s%s%s [%s]: ", Bold, label, Reset, display)
+		val, _ := reader.ReadString('\n')
+		val = strings.TrimSpace(val)
+		if val == "none" {
+			return ""
+		}
+		if val == "" {
+			return current
+		}
+		return val
 	}
+
+	state.bots.TelegramToken = ask("Telegram Bot Token", state.bots.TelegramToken)
+	state.bots.DiscordAppID = ask("Discord App ID", state.bots.DiscordAppID)
+	state.bots.DiscordPublicKey = ask("Discord Public Key", state.bots.DiscordPublicKey)
+	state.bots.DiscordBotToken = ask("Discord Bot Token", state.bots.DiscordBotToken)
+	state.bots.WhatsAppToken = ask("WhatsApp Token", state.bots.WhatsAppToken)
+	state.bots.WhatsAppPhoneID = ask("WhatsApp Phone ID", state.bots.WhatsAppPhoneID)
+	state.bots.WhatsAppVerify = ask("WhatsApp Verify Token", state.bots.WhatsAppVerify)
+	state.bots.ServerPort = ask("Webhook Port (default 8080)", state.bots.ServerPort)
+
+	saveConfig()
+	printSuccess("Bot integrations updated. Restart Axiom to apply network changes.")
 }
 
 func handleModel(reader *bufio.Reader) {
-	if !state.connected {
-		printError("No provider configured")
-		return
-	}
-
 	prov := PROVIDERS[state.provider]
 	cfg := state.configs[state.provider]
 	current := cfg.Model
@@ -1402,15 +1559,12 @@ func handleModel(reader *bufio.Reader) {
 	fmt.Printf("  %sNew model:%s ", Bold, Reset)
 	m, _ := reader.ReadString('\n')
 	m = strings.TrimSpace(m)
-
-	if m == "" {
-		return
+	if m != "" {
+		cfg.Model = m
+		state.configs[state.provider] = cfg
+		saveConfig()
+		printSuccess("Model → " + m)
 	}
-
-	cfg.Model = m
-	state.configs[state.provider] = cfg
-	saveConfig()
-	printSuccess("Model → " + m)
 }
 
 func handleClear() {
@@ -1422,20 +1576,16 @@ func handleClear() {
 
 func handleStatus() {
 	fmt.Println()
-
 	if !state.connected {
 		fmt.Printf("  %sStatus:%s %sDisconnected%s\n", Bold, Reset, Red, Reset)
-		fmt.Printf("  Run /config to connect\n")
 		return
 	}
-
 	prov := PROVIDERS[state.provider]
 	cfg := state.configs[state.provider]
 	model := cfg.Model
 	if model == "" {
 		model = prov.DefaultModel
 	}
-
 	cwd, _ := os.Getwd()
 	elapsed := time.Since(state.startTime).Truncate(time.Second)
 
@@ -1444,8 +1594,6 @@ func handleStatus() {
 	fmt.Printf("  %sWorkspace%s  %s\n", Dim, Reset, cwd)
 	fmt.Printf("  %sSession%s    %s\n", Dim, Reset, elapsed)
 	fmt.Printf("  %sMessages%s   %d\n", Dim, Reset, len(state.history))
-	fmt.Printf("  %sTools%s      %d calls\n", Dim, Reset, state.toolCalls)
-	fmt.Printf("  %sTokens%s     ~%d\n", Dim, Reset, state.tokens)
 	fmt.Println()
 }
 
@@ -1455,7 +1603,7 @@ func handleFiles() {
 		if err != nil {
 			return nil
 		}
-		if info.IsDir() && (strings.HasPrefix(info.Name(), ".") || info.Name() == "node_modules" || info.Name() == "vendor" || info.Name() == "__pycache__") {
+		if info.IsDir() && info.Name() != "." && (strings.HasPrefix(info.Name(), ".") || info.Name() == "node_modules" || info.Name() == "vendor" || info.Name() == "__pycache__") {
 			return filepath.SkipDir
 		}
 		if !info.IsDir() && !strings.HasPrefix(info.Name(), ".") {
@@ -1465,20 +1613,27 @@ func handleFiles() {
 	})
 
 	fmt.Printf("\n  %s%d files%s\n\n", Dim, len(files), Reset)
-
-	icons := map[string]string{
-		".go": "◆", ".js": "◇", ".ts": "◇", ".py": "○", ".rs": "●",
-		".md": "□", ".json": "◈", ".yaml": "◈", ".yml": "◈",
-		".html": "◎", ".css": "◎", ".sh": "▷",
-	}
-
 	for _, f := range files {
-		ext := filepath.Ext(f)
-		icon := "·"
-		if i, ok := icons[ext]; ok {
-			icon = i
-		}
-		fmt.Printf("  %s%s%s %s\n", Cyan, icon, Reset, f)
+		fmt.Printf("  %s·%s %s\n", Cyan, Reset, f)
+	}
+	fmt.Println()
+}
+
+func printHelp() {
+	fmt.Println()
+	fmt.Printf("  %s%sCOMMANDS%s\n\n", Bold, Cyan, Reset)
+	commands := [][]string{
+		{"/config", "Configure AI provider"},
+		{"/bots", "Configure Telegram/Discord/WhatsApp"},
+		{"/model", "Change model"},
+		{"/clear", "Clear conversation"},
+		{"/status", "Show session info"},
+		{"/files", "List project files"},
+		{"/help", "Show this help"},
+		{"/exit", "Exit Axiom"},
+	}
+	for _, cmd := range commands {
+		fmt.Printf("  %s%-12s%s %s\n", Yellow, cmd[0], Reset, Dim+cmd[1]+Reset)
 	}
 	fmt.Println()
 }
@@ -1489,12 +1644,24 @@ func min(a, b int) int {
 	}
 	return b
 }
-
 func max(a, b int) int {
 	if a > b {
 		return a
 	}
 	return b
+}
+
+func printWelcome() {
+	clearScreen()
+	printLogo()
+	if state.connected {
+		p := PROVIDERS[state.provider]
+		fmt.Printf("  %sConnected to %s%s%s\n", Dim, Reset+Green, p.Name, Reset+Dim)
+	} else {
+		fmt.Printf("  %sType %s/config%s to get started.%s\n", Dim, Yellow, Dim, Reset)
+	}
+	fmt.Println()
+	printDivider()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1503,9 +1670,10 @@ func max(a, b int) int {
 
 func main() {
 	loadConfig()
-	reader := bufio.NewReader(os.Stdin)
-
+	StartBots()
 	printWelcome()
+
+	reader := bufio.NewReader(os.Stdin)
 
 	for {
 		printStatusBar()
@@ -1529,6 +1697,8 @@ func main() {
 			printHelp()
 		case input == "/config":
 			handleConfig(reader)
+		case input == "/bots":
+			handleBots(reader)
 		case input == "/model":
 			handleModel(reader)
 		case input == "/clear", input == "/reset":
