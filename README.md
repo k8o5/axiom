@@ -27,19 +27,19 @@ Axiom brings the power of modern AI coding assistants (Claude, GPT-4, Gemini, lo
 
 **Via Go:**
 ```bash
-go install github.com/yourusername/axiom@latest
+go install github.com/k8o5/axiom
 ```
 
 **From Source:**
 ```bash
-git clone https://github.com/yourusername/axiom.git
+git clone https://github.com/k8o5/axiom.git
 cd axiom
 go build -o axiom
 ./axiom
 ```
 
 **Pre-built Binaries:**
-Download from [Releases](https://github.com/yourusername/axiom/releases)
+Download from [Releases](https://github.com/k8o5/axiom/releases)
 
 ### First Run
 
