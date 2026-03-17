@@ -610,8 +610,6 @@ func printToolCall(name string, args map[string]interface{}, result map[string]i
 		icon, color = "📷", Magenta
 	case "shell":
 		icon, color = "▶", Yellow
-	case "show":
-		icon, color = "📢", Magenta
 	}
 
 	if _, isMcp := state.mcpToolMap[name]; isMcp {
@@ -831,10 +829,8 @@ func readLine(prompt string, history []string) string {
 					i = n
 				} else {
 					// Single ESC key -> clear the line
-					buf = []rune{}
-					cursor = 0
-					redraw()
-					i++
+					fmt.Println()
+					return ""
 				}
 			} else {
 				// Regular characters
@@ -918,11 +914,6 @@ func runTool(name string, args map[string]interface{}) map[string]interface{} {
 	}
 
 	switch name {
-	case "show":
-		msg := getString("message")
-		fmt.Printf("\n  %s📢 %s%s\n", Magenta, msg, Reset)
-		result["success"] = true
-
 	case "take_screenshot":
 		filename := "screenshot_" + time.Now().Format("20060102_150405") + ".png"
 		err := takeScreenshot(filename)
@@ -1334,9 +1325,7 @@ TOOLS (respond with JSON in code blocks):
 6. **shell**
    `+"```json\n"+`{"tool": "shell", "args": {"command": "curl -s 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd'"}}`+"\n```"+`
 7. **take_screenshot** (Take a picture of the user's screen and look at it!)
-   `+"```json\n"+`{"tool": "take_screenshot", "args": {}}`+"\n```"+`
-8. **show** (Print an important message, warning, or final result prominently to the user)
-   `+"```json\n"+`{"tool": "show", "args": {"message": "Server started on port 8080!"}}`+"\n```", cwd, runtime.GOOS)
+   `+"```json\n"+`{"tool": "take_screenshot", "args": {}}`+"\n```", cwd, runtime.GOOS)
 
 	// Dynamically Append Discovered MCP Tools
 	if len(state.mcpTools) > 0 {
@@ -1538,7 +1527,7 @@ func main() {
 
 		switch {
 		case input == "/exit", input == "/quit", input == "/q":
-			fmt.Println("\n  " + Dim + "Goodbye!" + Reset + "\n")
+			fmt.Printf("\n  %sGoodbye!%s\n\n", Dim, Reset)
 			return
 		case input == "/help", input == "/?":
 			printHelp()
