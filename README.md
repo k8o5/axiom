@@ -410,13 +410,6 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ---
 
-## 🙏 Acknowledgments
-
-Inspired by:
-- [Cursor](https://cursor.sh) - AI-first code editor
-- [Aider](https://github.com/paul-gauthier/aider) - AI pair programming in terminal
-- [OpenCode](https://github.com/opencode) - Open source AI coding assistant
-
 Built with:
 - Go standard library (zero external dependencies!)
 - Love for clean, minimal UIs ❤️
