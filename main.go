@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -610,8 +611,6 @@ func printToolCall(name string, args map[string]interface{}, result map[string]i
 		icon, color = "📷", Magenta
 	case "shell":
 		icon, color = "▶", Yellow
-	case "show":
-		icon, color = "📢", Magenta
 	}
 
 	if _, isMcp := state.mcpToolMap[name]; isMcp {
@@ -677,16 +676,41 @@ func printSuccess(msg string) {
 	fmt.Printf("\n  %s✓%s %s\n", Green, Reset, msg)
 }
 
-func printSpinner(done chan bool, message string) {
+func printSpinner(done chan bool, interrupted chan bool, message string) {
 	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	i := 0
+
+	if runtime.GOOS != "windows" {
+		// Set terminal to non-blocking mode to catch interruption
+		oldState, _ := setRawMode()
+		defer restoreMode(oldState)
+		// Additional stty to ensure non-blocking read
+		cmd := exec.Command("stty", "-icanon", "-echo", "min", "0", "time", "0")
+		cmd.Stdin = os.Stdin
+		cmd.Run()
+	}
+
 	for {
 		select {
 		case <-done:
 			fmt.Printf("\r%s\r", ClearLine)
 			return
 		default:
-			fmt.Printf("\r  %s%s%s %s", Cyan, frames[i%len(frames)], Reset, Dim+message+Reset)
+			fmt.Printf("\r  %s%s%s %s %s(press ESC to stop)%s", Cyan, frames[i%len(frames)], Reset, Dim+message+Reset, Gray+Italic, Reset)
+
+			if runtime.GOOS != "windows" {
+				// Check for ESC key
+				b := make([]byte, 1)
+				n, _ := os.Stdin.Read(b)
+				if n > 0 && b[0] == 27 {
+					// Check if more characters follow ESC (not a single ESC)
+					// If so, we might want to discard them, but let's keep it simple for now.
+					close(interrupted)
+					fmt.Printf("\r%s\r  %sInterrupted%s\n", ClearLine, Red+Bold, Reset)
+					return
+				}
+			}
+
 			time.Sleep(80 * time.Millisecond)
 			i++
 		}
@@ -782,59 +806,63 @@ func readLine(prompt string, history []string) string {
 				}
 				i++
 			} else if c == 27 { // ESC
-				if i+2 < n && b[i+1] == '[' {
-					if b[i+2] >= 'A' && b[i+2] <= 'D' {
-						seq := b[i+2]
-						i += 3
-						switch seq {
-						case 'A': // Up Arrow
-							if histIdx > 0 {
-								histIdx--
-								buf = []rune(history[histIdx])
-								cursor = len(buf)
-								redraw()
-							}
-						case 'B': // Down Arrow
-							if histIdx < len(history)-1 {
-								histIdx++
-								buf = []rune(history[histIdx])
-								cursor = len(buf)
-								redraw()
-							} else if histIdx == len(history)-1 {
-								histIdx++
-								buf = []rune{}
-								cursor = 0
-								redraw()
-							}
-						case 'C': // Right Arrow
-							if cursor < len(buf) {
-								cursor++
-								redraw()
-							}
-						case 'D': // Left Arrow
-							if cursor > 0 {
-								cursor--
-								redraw()
+				if i+1 < n {
+					if b[i+1] == '[' {
+						if i+2 < n {
+							if b[i+2] >= 'A' && b[i+2] <= 'D' {
+								seq := b[i+2]
+								i += 3
+								switch seq {
+								case 'A': // Up Arrow
+									if histIdx > 0 {
+										histIdx--
+										buf = []rune(history[histIdx])
+										cursor = len(buf)
+										redraw()
+									}
+								case 'B': // Down Arrow
+									if histIdx < len(history)-1 {
+										histIdx++
+										buf = []rune(history[histIdx])
+										cursor = len(buf)
+										redraw()
+									} else if histIdx == len(history)-1 {
+										histIdx++
+										buf = []rune{}
+										cursor = 0
+										redraw()
+									}
+								case 'C': // Right Arrow
+									if cursor < len(buf) {
+										cursor++
+										redraw()
+									}
+								case 'D': // Left Arrow
+									if cursor > 0 {
+										cursor--
+										redraw()
+									}
+								}
+								continue
+							} else if i+3 < n && b[i+2] == '3' && b[i+3] == '~' { // Delete Key
+								if cursor < len(buf) {
+									buf = append(buf[:cursor], buf[cursor+1:]...)
+									redraw()
+								}
+								i += 4
+								continue
 							}
 						}
-						continue
+						// Unknown escape sequence starting with ESC [, skip it
+						i = n
+					} else {
+						// ESC followed by something else (but not [), skip just ESC
+						i++
 					}
-					if i+3 < n && b[i+2] == '3' && b[i+3] == '~' { // Delete Key
-						if cursor < len(buf) {
-							buf = append(buf[:cursor], buf[cursor+1:]...)
-							redraw()
-						}
-						i += 4
-						continue
-					}
-					// Unknown escape sequence, skip it
-					i = n
 				} else {
-					// Single ESC key -> clear the line
-					buf = []rune{}
-					cursor = 0
-					redraw()
-					i++
+					// Single ESC key at the end of the read buffer -> clear the line
+					fmt.Println()
+					return ""
 				}
 			} else {
 				// Regular characters
@@ -918,11 +946,6 @@ func runTool(name string, args map[string]interface{}) map[string]interface{} {
 	}
 
 	switch name {
-	case "show":
-		msg := getString("message")
-		fmt.Printf("\n  %s📢 %s%s\n", Magenta, msg, Reset)
-		result["success"] = true
-
 	case "take_screenshot":
 		filename := "screenshot_" + time.Now().Format("20060102_150405") + ".png"
 		err := takeScreenshot(filename)
@@ -1173,21 +1196,55 @@ func runAI() {
 		fullCfg.Endpoint = p.DefaultEndpoint
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	for iter := 0; iter < maxIter; iter++ {
 		done := make(chan bool)
-		go printSpinner(done, "thinking...")
+		interrupted := make(chan bool)
+		go printSpinner(done, interrupted, "thinking...")
 
 		reqData := p.BuildRequest(state.history, fullCfg)
 		bodyBytes, _ := json.Marshal(reqData.Body)
-		req, _ := http.NewRequest("POST", reqData.URL, bytes.NewBuffer(bodyBytes))
+		req, _ := http.NewRequestWithContext(ctx, "POST", reqData.URL, bytes.NewBuffer(bodyBytes))
 		for k, v := range reqData.Headers {
 			req.Header.Set(k, v)
 		}
 
 		client := &http.Client{Timeout: 120 * time.Second}
-		resp, err := client.Do(req)
+		respChan := make(chan struct {
+			resp *http.Response
+			err  error
+		}, 1)
 
-		done <- true
+		go func() {
+			resp, err := client.Do(req)
+			respChan <- struct {
+				resp *http.Response
+				err  error
+			}{resp, err}
+		}()
+
+		var resp *http.Response
+		var err error
+
+		select {
+		case res := <-respChan:
+			resp = res.resp
+			err = res.err
+			select {
+			case done <- true:
+			default:
+			}
+		case <-interrupted:
+			cancel()
+			select {
+			case done <- true:
+			default:
+			}
+			return
+		}
+
 		time.Sleep(50 * time.Millisecond)
 
 		if err != nil {
@@ -1334,9 +1391,7 @@ TOOLS (respond with JSON in code blocks):
 6. **shell**
    `+"```json\n"+`{"tool": "shell", "args": {"command": "curl -s 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd'"}}`+"\n```"+`
 7. **take_screenshot** (Take a picture of the user's screen and look at it!)
-   `+"```json\n"+`{"tool": "take_screenshot", "args": {}}`+"\n```"+`
-8. **show** (Print an important message, warning, or final result prominently to the user)
-   `+"```json\n"+`{"tool": "show", "args": {"message": "Server started on port 8080!"}}`+"\n```", cwd, runtime.GOOS)
+   `+"```json\n"+`{"tool": "take_screenshot", "args": {}}`+"\n```", cwd, runtime.GOOS)
 
 	// Dynamically Append Discovered MCP Tools
 	if len(state.mcpTools) > 0 {
@@ -1480,7 +1535,7 @@ func printHelp() {
 	fmt.Printf("  %s%sCOMMANDS%s\n\n", Bold, Cyan, Reset)
 	commands := [][]string{
 		{"/config", "Configure AI provider"},
-		{"/status", "Show session & MCP connection details"},
+		{"/status", "View session & MCP connection details"},
 		{"/clear", "Clear conversation history"},
 		{"/exit", "Exit Axiom"},
 	}
@@ -1538,7 +1593,7 @@ func main() {
 
 		switch {
 		case input == "/exit", input == "/quit", input == "/q":
-			fmt.Println("\n  " + Dim + "Goodbye!" + Reset + "\n")
+			fmt.Printf("\n  %sGoodbye!%s\n\n", Dim, Reset)
 			return
 		case input == "/help", input == "/?":
 			printHelp()
