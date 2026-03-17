@@ -68,7 +68,7 @@ Select a provider (e.g., `google` for Gemini), enter your API key, and you're re
 | `/clear` | Clear conversation history |
 | `/status` | View session info and stats |
 | `/files` | List all files in current directory |
-| `/help` | Show all available commands |
+| `/help` | List all available commands |
 | `/exit` | Quit Axiom |
 
 ### Natural Conversation
