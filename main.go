@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 var aiMutex sync.Mutex
@@ -43,13 +44,6 @@ const (
 	ClearLine  = "\033[2K"
 )
 
-const (
-	SynKeyword = Magenta
-	SynString  = Green
-	SynNumber  = Yellow
-	SynComment = Gray
-)
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONFIG & STATE
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -66,7 +60,7 @@ func getConfigPath() string {
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
-	Image   string `json:"image,omitempty"` // Base64 Encoded Image Data
+	Image   string `json:"image,omitempty"`
 }
 
 type ProviderConfig struct {
@@ -76,9 +70,12 @@ type ProviderConfig struct {
 }
 
 type SavedConfig struct {
-	Provider string                    `json:"provider"`
-	Configs  map[string]ProviderConfig `json:"configs"`
+	Provider   string                    `json:"provider"`
+	Configs    map[string]ProviderConfig `json:"configs"`
+	MCPServers map[string][]string       `json:"mcp_servers,omitempty"`
 }
+
+var mcpErrors []string
 
 var state = struct {
 	provider   string
@@ -88,11 +85,19 @@ var state = struct {
 	cmdHistory []string
 	startTime  time.Time
 	toolCalls  int
+	mcpConfig  map[string][]string
+	mcpServers map[string]*MCPServer
+	mcpTools   []MCPTool
+	mcpToolMap map[string]string
 }{
-	provider:  "cloudflare",
-	configs:   make(map[string]ProviderConfig),
-	history:   []Message{},
-	startTime: time.Now(),
+	provider:   "cloudflare",
+	configs:    make(map[string]ProviderConfig),
+	history:    []Message{},
+	startTime:  time.Now(),
+	mcpConfig:  make(map[string][]string),
+	mcpServers: make(map[string]*MCPServer),
+	mcpTools:   []MCPTool{},
+	mcpToolMap: make(map[string]string),
 }
 
 type APIRequest struct {
@@ -112,24 +117,185 @@ type ProviderDef struct {
 var PROVIDERS map[string]ProviderDef
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// PAYLOAD BUILDERS (WITH FALLBACK FOR TEXT-ONLY MODELS)
+// MCP (MODEL CONTEXT PROTOCOL) CLIENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+type RPCMessage struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      *int            `json:"id,omitempty"`
+	Method  string          `json:"method,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   json.RawMessage `json:"error,omitempty"`
+}
+
+type MCPServer struct {
+	Name    string
+	Cmd     *exec.Cmd
+	Stdin   io.WriteCloser
+	Stdout  io.ReadCloser
+	Pending map[int]chan RPCMessage
+	NextID  int
+	Mutex   sync.Mutex
+}
+
+type MCPTool struct {
+	ServerName  string
+	Name        string
+	Description string
+	InputSchema string
+}
+
+func (m *MCPServer) SendRequest(method string, params interface{}, timeout time.Duration) (json.RawMessage, error) {
+	m.Mutex.Lock()
+	id := m.NextID
+	m.NextID++
+	ch := make(chan RPCMessage, 1)
+	m.Pending[id] = ch
+	m.Mutex.Unlock()
+
+	req := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"method":  method,
+	}
+	if params != nil {
+		req["params"] = params
+	}
+	b, _ := json.Marshal(req)
+	m.Stdin.Write(append(b, '\n'))
+
+	select {
+	case resp := <-ch:
+		if resp.Error != nil {
+			return nil, fmt.Errorf("rpc error: %s", string(resp.Error))
+		}
+		return resp.Result, nil
+	case <-time.After(timeout):
+		m.Mutex.Lock()
+		delete(m.Pending, id)
+		m.Mutex.Unlock()
+		return nil, fmt.Errorf("timeout waiting for %s", method)
+	}
+}
+
+func (m *MCPServer) readLoop() {
+	scanner := bufio.NewScanner(m.Stdout)
+	buf := make([]byte, 0, 1024*1024)
+	scanner.Buffer(buf, 10*1024*1024)
+
+	for scanner.Scan() {
+		var msg RPCMessage
+		if err := json.Unmarshal(scanner.Bytes(), &msg); err == nil {
+			if msg.ID != nil {
+				m.Mutex.Lock()
+				ch, ok := m.Pending[*msg.ID]
+				if ok {
+					delete(m.Pending, *msg.ID)
+					ch <- msg
+				}
+				m.Mutex.Unlock()
+			}
+		}
+	}
+}
+
+func initMCPServer(name string, command []string) error {
+	if len(command) == 0 {
+		return fmt.Errorf("empty command")
+	}
+	cmd := exec.Command(command[0], command[1:]...)
+	cmd.Dir, _ = os.Getwd()
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	cmd.Stderr = nil // Ignore stderr for clean console, or write to log
+
+	server := &MCPServer{
+		Name:    name,
+		Cmd:     cmd,
+		Stdin:   stdin,
+		Stdout:  stdout,
+		Pending: make(map[int]chan RPCMessage),
+		NextID:  1,
+	}
+
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	go server.readLoop()
+
+	initParams := map[string]interface{}{
+		"protocolVersion": "2024-11-05",
+		"clientInfo": map[string]interface{}{
+			"name": "axiom", "version": "1.0.0",
+		},
+		"capabilities": map[string]interface{}{},
+	}
+
+	_, err = server.SendRequest("initialize", initParams, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("initialize failed: %v", err)
+	}
+
+	initNotif := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "notifications/initialized",
+	}
+	b, _ := json.Marshal(initNotif)
+	server.Stdin.Write(append(b, '\n'))
+
+	toolsRes, err := server.SendRequest("tools/list", nil, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("tools/list failed: %v", err)
+	}
+
+	var toolsData struct {
+		Tools []struct {
+			Name        string          `json:"name"`
+			Description string          `json:"description"`
+			InputSchema json.RawMessage `json:"inputSchema"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(toolsRes, &toolsData); err != nil {
+		return fmt.Errorf("failed to parse tools: %v", err)
+	}
+
+	for _, t := range toolsData.Tools {
+		state.mcpTools = append(state.mcpTools, MCPTool{
+			ServerName:  name,
+			Name:        t.Name,
+			Description: t.Description,
+			InputSchema: string(t.InputSchema),
+		})
+		state.mcpToolMap[t.Name] = name
+	}
+
+	state.mcpServers[name] = server
+	return nil
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PAYLOAD BUILDERS
 // ═══════════════════════════════════════════════════════════════════════════════
 
 func isVisionModel(model string) bool {
 	m := strings.ToLower(model)
-	return strings.Contains(m, "vision") ||
-		strings.Contains(m, "gpt-4o") ||
-		strings.Contains(m, "claude-3") ||
-		strings.Contains(m, "gemini") ||
-		strings.Contains(m, "pixtral") ||
-		strings.Contains(m, "llama-3.2-11b") ||
-		strings.Contains(m, "llama-3.2-90b")
+	return strings.Contains(m, "vision") || strings.Contains(m, "gpt-4o") ||
+		strings.Contains(m, "claude-3") || strings.Contains(m, "gemini") ||
+		strings.Contains(m, "pixtral") || strings.Contains(m, "llama-3.2")
 }
 
 func buildOpenAIMessages(msgs []Message, model string) []map[string]interface{} {
 	vision := isVisionModel(model)
 	var out []map[string]interface{}
-
 	for _, m := range msgs {
 		if m.Image != "" && vision {
 			out = append(out, map[string]interface{}{
@@ -140,14 +306,7 @@ func buildOpenAIMessages(msgs []Message, model string) []map[string]interface{} 
 				},
 			})
 		} else {
-			content := m.Content
-			if m.Image != "" && !vision {
-				content += fmt.Sprintf("\n\n[System Note: A screenshot was captured, but your current model (%s) is a text-only model. You cannot see the image. If you need to analyze it, tell the user to switch to a vision model.]", model)
-			}
-			out = append(out, map[string]interface{}{
-				"role":    m.Role,
-				"content": content,
-			})
+			out = append(out, map[string]interface{}{"role": m.Role, "content": m.Content})
 		}
 	}
 	return out
@@ -156,7 +315,6 @@ func buildOpenAIMessages(msgs []Message, model string) []map[string]interface{} 
 func buildAnthropicMessages(msgs []Message, model string) []map[string]interface{} {
 	vision := isVisionModel(model)
 	var out []map[string]interface{}
-
 	for _, m := range msgs {
 		if m.Role == "system" {
 			continue
@@ -170,14 +328,7 @@ func buildAnthropicMessages(msgs []Message, model string) []map[string]interface
 				},
 			})
 		} else {
-			content := m.Content
-			if m.Image != "" && !vision {
-				content += "\n\n[System Note: A screenshot was captured, but you lack vision capabilities.]"
-			}
-			out = append(out, map[string]interface{}{
-				"role":    m.Role,
-				"content": content,
-			})
+			out = append(out, map[string]interface{}{"role": m.Role, "content": m.Content})
 		}
 	}
 	return out
@@ -186,36 +337,22 @@ func buildAnthropicMessages(msgs []Message, model string) []map[string]interface
 func buildGeminiMessages(msgs []Message, model string) []map[string]interface{} {
 	vision := isVisionModel(model)
 	var contents []map[string]interface{}
-
 	for _, m := range msgs {
 		role := "user"
 		if m.Role == "assistant" {
 			role = "model"
 		}
-		
-		content := m.Content
-		if m.Image != "" && !vision {
-			content += "\n\n[System Note: A screenshot was captured, but you lack vision capabilities.]"
-		}
-
-		parts := []map[string]interface{}{{"text": content}}
+		parts := []map[string]interface{}{{"text": m.Content}}
 		if m.Image != "" && vision {
 			parts = append(parts, map[string]interface{}{
-				"inline_data": map[string]interface{}{
-					"mime_type": "image/png",
-					"data":      m.Image,
-				},
+				"inline_data": map[string]interface{}{"mime_type": "image/png", "data": m.Image},
 			})
 		}
-
 		if len(contents) > 0 && contents[len(contents)-1]["role"] == role {
 			prevParts := contents[len(contents)-1]["parts"].([]map[string]interface{})
 			contents[len(contents)-1]["parts"] = append(prevParts, parts...)
 		} else {
-			contents = append(contents, map[string]interface{}{
-				"role":  role,
-				"parts": parts,
-			})
+			contents = append(contents, map[string]interface{}{"role": role, "parts": parts})
 		}
 	}
 	return contents
@@ -310,12 +447,27 @@ func loadConfig() error {
 			state.connected = true
 		}
 	}
+	if saved.MCPServers != nil {
+		state.mcpConfig = saved.MCPServers
+		for name, cmdArgs := range saved.MCPServers {
+			if len(cmdArgs) > 0 {
+				err := initMCPServer(name, cmdArgs)
+				if err != nil {
+					mcpErrors = append(mcpErrors, fmt.Sprintf("%s: %v", name, err))
+				}
+			}
+		}
+	}
 	return nil
 }
 
 func saveConfig() error {
 	os.MkdirAll(getConfigDir(), 0755)
-	data, _ := json.MarshalIndent(SavedConfig{Provider: state.provider, Configs: state.configs}, "", "  ")
+	data, _ := json.MarshalIndent(SavedConfig{
+		Provider:   state.provider,
+		Configs:    state.configs,
+		MCPServers: state.mcpConfig,
+	}, "", "  ")
 	return os.WriteFile(getConfigPath(), data, 0600)
 }
 
@@ -327,9 +479,7 @@ func clearScreen() {
 	fmt.Print("\033[H\033[2J")
 }
 
-func getTermWidth() int {
-	return 80
-}
+func getTermWidth() int { return 80 }
 
 func stripAnsi(s string) string {
 	re := regexp.MustCompile(`\x1b\[[0-9;]*m`)
@@ -340,9 +490,7 @@ func renderMarkdown(text string) string {
 	codeBlockRe := regexp.MustCompile("(?s)```(\\w*)\\n(.*?)```")
 	text = codeBlockRe.ReplaceAllStringFunc(text, func(match string) string {
 		parts := codeBlockRe.FindStringSubmatch(match)
-		lang := parts[1]
-		code := parts[2]
-		return renderCodeBlock(code, lang)
+		return renderCodeBlock(parts[2], parts[1])
 	})
 
 	inlineCodeRe := regexp.MustCompile("`([^`]+)`")
@@ -427,8 +575,7 @@ func printStatusBar() {
 
 func printFileDiff(filename string, oldLines, newLines []string, startLine int) {
 	fmt.Printf("\n  %s%s─── %s%s\n", Gray, Bold, filename, Reset)
-	maxOld := 3
-	maxNew := 5
+	maxOld, maxNew := 3, 5
 
 	shown := 0
 	for i, line := range oldLines {
@@ -463,6 +610,12 @@ func printToolCall(name string, args map[string]interface{}, result map[string]i
 		icon, color = "📷", Magenta
 	case "shell":
 		icon, color = "▶", Yellow
+	case "show":
+		icon, color = "📢", Magenta
+	}
+
+	if _, isMcp := state.mcpToolMap[name]; isMcp {
+		icon, color = "🔌", Cyan
 	}
 
 	fmt.Printf("\n  %s%s%s %s%s%s", color, icon, Reset, Bold, name, Reset)
@@ -476,6 +629,12 @@ func printToolCall(name string, args map[string]interface{}, result map[string]i
 		}
 		fmt.Printf(" %s%s%s", Gray, cmd, Reset)
 	}
+	if msg, ok := args["message"].(string); ok {
+		if len(msg) > 30 {
+			msg = msg[:27] + "..."
+		}
+		fmt.Printf(" %s%s%s", Gray, msg, Reset)
+	}
 
 	if _, ok := result["error"]; ok {
 		fmt.Printf(" %s✗ %s%s\n", Red, result["error"], Reset)
@@ -483,6 +642,16 @@ func printToolCall(name string, args map[string]interface{}, result map[string]i
 		fmt.Printf(" %s✓ (%v bytes)%s\n", Green, size, Reset)
 	} else {
 		fmt.Printf(" %s✓%s\n", Green, Reset)
+	}
+
+	if stdout, ok := result["stdout"].(string); ok && strings.TrimSpace(stdout) != "" {
+		fmt.Print(renderCodeBlock(strings.TrimSpace(stdout), "stdout"))
+	}
+	if stderr, ok := result["stderr"].(string); ok && strings.TrimSpace(stderr) != "" {
+		fmt.Print(renderCodeBlock(strings.TrimSpace(stderr), "stderr"))
+	}
+	if mcpRes, ok := result["mcp_result"].(string); ok && strings.TrimSpace(mcpRes) != "" {
+		fmt.Print(renderCodeBlock(strings.TrimSpace(mcpRes), "mcp"))
 	}
 }
 
@@ -525,7 +694,173 @@ func printSpinner(done chan bool, message string) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// OS TOOLS
+// TERMINAL INPUT (Raw Mode & History loop)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var fallbackReader *bufio.Reader
+
+func setRawMode() (string, error) {
+	cmd := exec.Command("stty", "-g")
+	cmd.Stdin = os.Stdin
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	cmd2 := exec.Command("stty", "-icanon", "-echo")
+	cmd2.Stdin = os.Stdin
+	cmd2.Run()
+	return strings.TrimSpace(string(out)), nil
+}
+
+func restoreMode(state string) {
+	if state == "" {
+		return
+	}
+	cmd := exec.Command("stty", state)
+	cmd.Stdin = os.Stdin
+	cmd.Run()
+}
+
+func readLine(prompt string, history []string) string {
+	state, err := setRawMode()
+	if err != nil {
+		// Fallback for Windows or systems without stty
+		fmt.Print(prompt)
+		if fallbackReader == nil {
+			fallbackReader = bufio.NewReader(os.Stdin)
+		}
+		text, _ := fallbackReader.ReadString('\n')
+		return strings.TrimRight(text, "\r\n")
+	}
+	defer restoreMode(state)
+
+	var buf []rune
+	cursor := 0
+	histIdx := len(history)
+
+	redraw := func() {
+		fmt.Print("\r\033[2K" + prompt + string(buf))
+		if cursor < len(buf) {
+			fmt.Printf("\033[%dD", len(buf)-cursor)
+		}
+	}
+
+	redraw()
+
+	b := make([]byte, 1024)
+	for {
+		n, err := os.Stdin.Read(b)
+		if err != nil || n == 0 {
+			return string(buf)
+		}
+
+		i := 0
+		for i < n {
+			c := b[i]
+
+			if c == 3 { // Ctrl+C
+				fmt.Println()
+				os.Exit(0)
+			} else if c == 4 { // Ctrl+D
+				if len(buf) == 0 {
+					fmt.Println()
+					os.Exit(0)
+				}
+				i++
+			} else if c == 13 || c == 10 { // Enter
+				fmt.Println()
+				return string(buf)
+			} else if c == 12 { // Ctrl+L (Clear screen)
+				clearScreen()
+				redraw()
+				i++
+			} else if c == 127 || c == 8 { // Backspace
+				if cursor > 0 {
+					buf = append(buf[:cursor-1], buf[cursor:]...)
+					cursor--
+					redraw()
+				}
+				i++
+			} else if c == 27 { // ESC
+				if i+2 < n && b[i+1] == '[' {
+					if b[i+2] >= 'A' && b[i+2] <= 'D' {
+						seq := b[i+2]
+						i += 3
+						switch seq {
+						case 'A': // Up Arrow
+							if histIdx > 0 {
+								histIdx--
+								buf = []rune(history[histIdx])
+								cursor = len(buf)
+								redraw()
+							}
+						case 'B': // Down Arrow
+							if histIdx < len(history)-1 {
+								histIdx++
+								buf = []rune(history[histIdx])
+								cursor = len(buf)
+								redraw()
+							} else if histIdx == len(history)-1 {
+								histIdx++
+								buf = []rune{}
+								cursor = 0
+								redraw()
+							}
+						case 'C': // Right Arrow
+							if cursor < len(buf) {
+								cursor++
+								redraw()
+							}
+						case 'D': // Left Arrow
+							if cursor > 0 {
+								cursor--
+								redraw()
+							}
+						}
+						continue
+					}
+					if i+3 < n && b[i+2] == '3' && b[i+3] == '~' { // Delete Key
+						if cursor < len(buf) {
+							buf = append(buf[:cursor], buf[cursor+1:]...)
+							redraw()
+						}
+						i += 4
+						continue
+					}
+					// Unknown escape sequence, skip it
+					i = n
+				} else {
+					// Single ESC key -> clear the line
+					buf = []rune{}
+					cursor = 0
+					redraw()
+					i++
+				}
+			} else {
+				// Regular characters
+				r, size := utf8.DecodeRune(b[i:n])
+				if r != utf8.RuneError || size > 1 {
+					if strconv.IsPrint(r) {
+						buf = append(buf[:cursor], append([]rune{r}, buf[cursor:]...)...)
+						cursor++
+						redraw()
+					}
+					i += size
+				} else {
+					if strconv.IsPrint(rune(c)) {
+						buf = append(buf[:cursor], append([]rune{rune(c)}, buf[cursor:]...)...)
+						cursor++
+						redraw()
+					}
+					i++
+				}
+			}
+		}
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OS TOOLS & MCP ROUTER
 // ═══════════════════════════════════════════════════════════════════════════════
 
 func takeScreenshot(filename string) error {
@@ -549,17 +884,14 @@ func takeScreenshot(filename string) error {
 				cmd = exec.Command("gnome-screenshot", "-f", filename)
 			} else if _, err := exec.LookPath("scrot"); err == nil {
 				cmd = exec.Command("scrot", filename)
-			} else if _, err := exec.LookPath("import"); err == nil {
-				cmd = exec.Command("import", "-window", "root", filename)
 			} else {
-				return fmt.Errorf("No screenshot tool found. For Hyprland/Wayland, please install 'grim'.")
+				return fmt.Errorf("No screenshot tool found.")
 			}
 		}
 	}
-	
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("Command execution failed: %v | Output: %s", err, string(out))
+		return fmt.Errorf("Execution failed: %v | Output: %s", err, string(out))
 	}
 	return nil
 }
@@ -577,9 +909,6 @@ func runTool(name string, args map[string]interface{}) map[string]interface{} {
 		if v, ok := args[k].(float64); ok {
 			return int(v)
 		}
-		if v, ok := args[k].(int); ok {
-			return v
-		}
 		if v, ok := args[k].(string); ok {
 			if i, err := strconv.Atoi(v); err == nil {
 				return i
@@ -589,6 +918,11 @@ func runTool(name string, args map[string]interface{}) map[string]interface{} {
 	}
 
 	switch name {
+	case "show":
+		msg := getString("message")
+		fmt.Printf("\n  %s📢 %s%s\n", Magenta, msg, Reset)
+		result["success"] = true
+
 	case "take_screenshot":
 		filename := "screenshot_" + time.Now().Format("20060102_150405") + ".png"
 		err := takeScreenshot(filename)
@@ -597,7 +931,7 @@ func runTool(name string, args map[string]interface{}) map[string]interface{} {
 		} else {
 			info, err := os.Stat(filename)
 			if err != nil || info.Size() == 0 {
-				result["error"] = "Screenshot tool ran, but the resulting file is empty or missing."
+				result["error"] = "Empty or missing image."
 			} else {
 				result["success"] = true
 				result["filename"] = filename
@@ -609,10 +943,7 @@ func runTool(name string, args map[string]interface{}) map[string]interface{} {
 	case "list_files":
 		var files []string
 		filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil
-			}
-			if info.IsDir() && info.Name() != "." && strings.HasPrefix(info.Name(), ".") {
+			if err != nil || (info.IsDir() && info.Name() != "." && strings.HasPrefix(info.Name(), ".")) {
 				return filepath.SkipDir
 			}
 			if !info.IsDir() && !strings.HasPrefix(info.Name(), ".") {
@@ -645,9 +976,7 @@ func runTool(name string, args map[string]interface{}) map[string]interface{} {
 
 	case "read_file":
 		filename := getString("filename")
-		start := getInt("start_line")
-		end := getInt("end_line")
-
+		start, end := getInt("start_line"), getInt("end_line")
 		content, err := os.ReadFile(filename)
 		if err != nil {
 			result["error"] = "File not found"
@@ -732,7 +1061,41 @@ func runTool(name string, args map[string]interface{}) map[string]interface{} {
 		}
 
 	default:
-		result["error"] = "Unknown tool: " + name
+		if serverName, ok := state.mcpToolMap[name]; ok {
+			server := state.mcpServers[serverName]
+			res, err := server.SendRequest("tools/call", map[string]interface{}{
+				"name":      name,
+				"arguments": args,
+			}, 30*time.Second)
+
+			if err != nil {
+				result["error"] = err.Error()
+			} else {
+				var callRes struct {
+					Content []struct {
+						Type string `json:"type"`
+						Text string `json:"text"`
+					} `json:"content"`
+					IsError bool `json:"isError"`
+				}
+				json.Unmarshal(res, &callRes)
+
+				output := ""
+				for _, c := range callRes.Content {
+					if c.Type == "text" {
+						output += c.Text + "\n"
+					}
+				}
+				if callRes.IsError {
+					result["error"] = output
+				} else {
+					result["mcp_result"] = output
+					result["success"] = true
+				}
+			}
+		} else {
+			result["error"] = "Unknown tool: " + name
+		}
 	}
 
 	return result
@@ -885,7 +1248,7 @@ func runAI() {
 				if tName == "" {
 					tName, _ = toolCmd["name"].(string)
 				}
-				
+
 				var tArgs interface{} = toolCmd["args"]
 				if tArgs == nil {
 					tArgs = toolCmd["arguments"]
@@ -920,12 +1283,12 @@ func runAI() {
 
 						resBytes, _ := json.Marshal(result)
 						state.history = append(state.history, Message{Role: "assistant", Content: content})
-						
+
 						msg := Message{
-							Role: "user", 
+							Role:    "user",
 							Content: fmt.Sprintf("Tool result: %s\n\nContinue or summarize.", string(resBytes)),
 						}
-						
+
 						if b64Img != "" {
 							msg.Image = b64Img
 						}
@@ -947,7 +1310,7 @@ func runAI() {
 
 func getSystemPrompt() string {
 	cwd, _ := os.Getwd()
-	return fmt.Sprintf(`You are Axiom, an elite, highly capable multimodal AI agent.
+	prompt := fmt.Sprintf(`You are Axiom, an elite, highly capable multimodal AI agent.
 WORKSPACE: %s
 OS: %s
 
@@ -971,7 +1334,20 @@ TOOLS (respond with JSON in code blocks):
 6. **shell**
    `+"```json\n"+`{"tool": "shell", "args": {"command": "curl -s 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd'"}}`+"\n```"+`
 7. **take_screenshot** (Take a picture of the user's screen and look at it!)
-   `+"```json\n"+`{"tool": "take_screenshot", "args": {}}`+"\n```", cwd, runtime.GOOS)
+   `+"```json\n"+`{"tool": "take_screenshot", "args": {}}`+"\n```"+`
+8. **show** (Print an important message, warning, or final result prominently to the user)
+   `+"```json\n"+`{"tool": "show", "args": {"message": "Server started on port 8080!"}}`+"\n```", cwd, runtime.GOOS)
+
+	// Dynamically Append Discovered MCP Tools
+	if len(state.mcpTools) > 0 {
+		prompt += "\n\nEXTERNAL MCP TOOLS (Available via standard JSON tool calls):\n"
+		for _, t := range state.mcpTools {
+			prompt += fmt.Sprintf("- **%s** (from %s)\n  Description: %s\n  Schema: %s\n", t.Name, t.ServerName, t.Description, t.InputSchema)
+		}
+		prompt += "\nUsage for MCP Tools:\n```json\n{\"tool\": \"tool_name\", \"args\": {\"param1\": \"value\"}}\n```\n"
+	}
+
+	return prompt
 }
 
 func sendMessage(text string) {
@@ -1001,16 +1377,15 @@ func sendMessage(text string) {
 // COMMANDS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-func handleConfig(reader *bufio.Reader) {
+func handleConfig() {
 	fmt.Println()
 	fmt.Printf("  %sPROVIDERS%s\n\n", Bold, Reset)
 	fmt.Printf("  %sCloud:%s    cloudflare google openai anthropic groq\n", Dim, Reset)
 	fmt.Printf("  %sLocal:%s    ollama lmstudio\n", Dim, Reset)
 	fmt.Println()
 
-	fmt.Printf("  %sProvider%s [%s]: ", Bold, Reset, state.provider)
-	p, _ := reader.ReadString('\n')
-	p = strings.TrimSpace(p)
+	prompt := fmt.Sprintf("  %sProvider%s [%s]: ", Bold, Reset, state.provider)
+	p := strings.TrimSpace(readLine(prompt, nil))
 	if p == "" {
 		p = state.provider
 	}
@@ -1028,9 +1403,8 @@ func handleConfig(reader *bufio.Reader) {
 		if cfg.Endpoint != "" {
 			defaultEp = cfg.Endpoint
 		}
-		fmt.Printf("  %sEndpoint%s [%s]: ", Bold, Reset, defaultEp)
-		ep, _ := reader.ReadString('\n')
-		ep = strings.TrimSpace(ep)
+		prompt := fmt.Sprintf("  %sEndpoint%s [%s]: ", Bold, Reset, defaultEp)
+		ep := strings.TrimSpace(readLine(prompt, nil))
 		if ep != "" {
 			cfg.Endpoint = ep
 		} else if cfg.Endpoint == "" {
@@ -1043,9 +1417,8 @@ func handleConfig(reader *bufio.Reader) {
 		if cfg.APIKey != "" {
 			keyHint = "****" + cfg.APIKey[max(0, len(cfg.APIKey)-4):]
 		}
-		fmt.Printf("  %sAPI Key%s [%s]: ", Bold, Reset, keyHint)
-		k, _ := reader.ReadString('\n')
-		k = strings.TrimSpace(k)
+		prompt := fmt.Sprintf("  %sAPI Key%s [%s]: ", Bold, Reset, keyHint)
+		k := strings.TrimSpace(readLine(prompt, nil))
 		if k != "" {
 			cfg.APIKey = k
 		}
@@ -1055,9 +1428,8 @@ func handleConfig(reader *bufio.Reader) {
 	if cfg.Model != "" {
 		defaultModel = cfg.Model
 	}
-	fmt.Printf("  %sModel%s [%s]: ", Bold, Reset, defaultModel)
-	m, _ := reader.ReadString('\n')
-	m = strings.TrimSpace(m)
+	prompt = fmt.Sprintf("  %sModel%s [%s]: ", Bold, Reset, defaultModel)
+	m := strings.TrimSpace(readLine(prompt, nil))
 	if m != "" {
 		cfg.Model = m
 	} else if cfg.Model == "" {
@@ -1086,10 +1458,20 @@ func handleStatus() {
 	}
 	elapsed := time.Since(state.startTime).Truncate(time.Second)
 
-	fmt.Printf("\n  %sProvider%s   %s%s%s\n", Dim, Reset, Green, prov.Name, Reset)
-	fmt.Printf("  %sModel%s      %s\n", Dim, Reset, model)
-	fmt.Printf("  %sSession%s    %s\n", Dim, Reset, elapsed)
-	fmt.Printf("  %sMessages%s   %d\n", Dim, Reset, len(state.history))
+	fmt.Printf("\n  %sProvider%s      %s%s%s\n", Dim, Reset, Green, prov.Name, Reset)
+	fmt.Printf("  %sModel%s         %s\n", Dim, Reset, model)
+	fmt.Printf("  %sSession%s       %s\n", Dim, Reset, elapsed)
+	fmt.Printf("  %sMessages%s      %d\n", Dim, Reset, len(state.history))
+
+	fmt.Printf("  %sMCP Servers%s   %d\n", Dim, Reset, len(state.mcpServers))
+	if len(state.mcpServers) > 0 {
+		var names []string
+		for k := range state.mcpServers {
+			names = append(names, k)
+		}
+		fmt.Printf("  %sActive MCP%s    %s (%d tools)\n", Dim, Reset, strings.Join(names, ", "), len(state.mcpTools))
+	}
+
 	fmt.Println()
 }
 
@@ -1098,7 +1480,7 @@ func printHelp() {
 	fmt.Printf("  %s%sCOMMANDS%s\n\n", Bold, Cyan, Reset)
 	commands := [][]string{
 		{"/config", "Configure AI provider"},
-		{"/status", "Show session info & workspace details"},
+		{"/status", "Show session & MCP connection details"},
 		{"/clear", "Clear conversation history"},
 		{"/exit", "Exit Axiom"},
 	}
@@ -1129,6 +1511,13 @@ func printWelcome() {
 	} else {
 		fmt.Printf("  %sType %s/config%s to get started.%s\n\n", Dim, Yellow, Dim, Reset)
 	}
+
+	for _, errStr := range mcpErrors {
+		printError("MCP Error: " + errStr)
+	}
+	if len(state.mcpServers) > 0 {
+		fmt.Printf("\n  %s✓ Connected to %d MCP servers (%d tools)%s\n\n", Green, len(state.mcpServers), len(state.mcpTools), Reset)
+	}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1139,16 +1528,9 @@ func main() {
 	loadConfig()
 	printWelcome()
 
-	reader := bufio.NewReader(os.Stdin)
-
 	for {
-		fmt.Printf("%s❯%s ", Cyan, Reset)
-
-		input, err := reader.ReadString('\n')
-		if err != nil {
-			break
-		}
-		input = strings.TrimSpace(input)
+		prompt := fmt.Sprintf("%s❯%s ", Cyan, Reset)
+		input := strings.TrimSpace(readLine(prompt, state.cmdHistory))
 
 		if input == "" {
 			continue
@@ -1161,7 +1543,7 @@ func main() {
 		case input == "/help", input == "/?":
 			printHelp()
 		case input == "/config":
-			handleConfig(reader)
+			handleConfig()
 		case input == "/clear", input == "/reset":
 			state.history = []Message{}
 			state.toolCalls = 0
