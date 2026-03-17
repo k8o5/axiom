@@ -392,7 +392,7 @@ Contributions are welcome! Here's how:
 ### Development Setup
 
 ```bash
-git clone https://github.com/yourusername/axiom.git
+git clone https://github.com/k8o5/axiom.git
 cd axiom
 go mod download
 go run main.go
@@ -418,9 +418,9 @@ Built with:
 
 ## 📞 Support
 
-- **Issues:** [GitHub Issues](https://github.com/yourusername/axiom/issues)
-- **Discussions:** [GitHub Discussions](https://github.com/yourusername/axiom/discussions)
-- **Twitter:** [@yourusername](https://twitter.com/yourusername)
+- **Issues:** [GitHub Issues](https://github.com/k8o5/axiom/issues)
+- **Discussions:** [GitHub Discussions](https://github.com/k8o5/axiom/discussions)
+- **Twitter:** [@yourusername](https://x.com/k8o5kebab3051)
 
 ---
 
