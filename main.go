@@ -64,9 +64,10 @@ type Message struct {
 }
 
 type ProviderConfig struct {
-	Endpoint string `json:"endpoint"`
-	APIKey   string `json:"apiKey"`
-	Model    string `json:"model"`
+	Endpoint   string `json:"endpoint"`
+	APIKey     string `json:"apiKey"`
+	Model      string `json:"model"`
+	ImageModel string `json:"imageModel"` // Dedicated Image Model config
 }
 
 type SavedConfig struct {
@@ -75,28 +76,28 @@ type SavedConfig struct {
 	MCPServers map[string][]string       `json:"mcp_servers,omitempty"`
 }
 
-var mcpErrors []string
+var mcpErrors[]string
 
 var state = struct {
 	provider   string
 	configs    map[string]ProviderConfig
 	connected  bool
 	history    []Message
-	cmdHistory []string
+	cmdHistory[]string
 	startTime  time.Time
 	toolCalls  int
 	mcpConfig  map[string][]string
 	mcpServers map[string]*MCPServer
-	mcpTools   []MCPTool
+	mcpTools[]MCPTool
 	mcpToolMap map[string]string
 }{
 	provider:   "cloudflare",
 	configs:    make(map[string]ProviderConfig),
-	history:    []Message{},
+	history:[]Message{},
 	startTime:  time.Now(),
 	mcpConfig:  make(map[string][]string),
 	mcpServers: make(map[string]*MCPServer),
-	mcpTools:   []MCPTool{},
+	mcpTools:[]MCPTool{},
 	mcpToolMap: make(map[string]string),
 }
 
@@ -200,7 +201,7 @@ func (m *MCPServer) readLoop() {
 	}
 }
 
-func initMCPServer(name string, command []string) error {
+func initMCPServer(name string, command[]string) error {
 	if len(command) == 0 {
 		return fmt.Errorf("empty command")
 	}
@@ -215,7 +216,7 @@ func initMCPServer(name string, command []string) error {
 	if err != nil {
 		return err
 	}
-	cmd.Stderr = nil // Ignore stderr for clean console, or write to log
+	cmd.Stderr = nil
 
 	server := &MCPServer{
 		Name:    name,
@@ -258,7 +259,7 @@ func initMCPServer(name string, command []string) error {
 	}
 
 	var toolsData struct {
-		Tools []struct {
+		Tools[]struct {
 			Name        string          `json:"name"`
 			Description string          `json:"description"`
 			InputSchema json.RawMessage `json:"inputSchema"`
@@ -293,7 +294,7 @@ func isVisionModel(model string) bool {
 		strings.Contains(m, "pixtral") || strings.Contains(m, "llama-3.2")
 }
 
-func buildOpenAIMessages(msgs []Message, model string) []map[string]interface{} {
+func buildOpenAIMessages(msgs[]Message, model string) []map[string]interface{} {
 	vision := isVisionModel(model)
 	var out []map[string]interface{}
 	for _, m := range msgs {
@@ -334,15 +335,15 @@ func buildAnthropicMessages(msgs []Message, model string) []map[string]interface
 	return out
 }
 
-func buildGeminiMessages(msgs []Message, model string) []map[string]interface{} {
+func buildGeminiMessages(msgs[]Message, model string) []map[string]interface{} {
 	vision := isVisionModel(model)
-	var contents []map[string]interface{}
+	var contents[]map[string]interface{}
 	for _, m := range msgs {
 		role := "user"
 		if m.Role == "assistant" {
 			role = "model"
 		}
-		parts := []map[string]interface{}{{"text": m.Content}}
+		parts :=[]map[string]interface{}{{"text": m.Content}}
 		if m.Image != "" && vision {
 			parts = append(parts, map[string]interface{}{
 				"inline_data": map[string]interface{}{"mime_type": "image/png", "data": m.Image},
@@ -361,7 +362,7 @@ func buildGeminiMessages(msgs []Message, model string) []map[string]interface{} 
 func init() {
 	PROVIDERS = map[string]ProviderDef{
 		"cloudflare": {
-			Name: "Cloudflare", Type: "custom", DefaultModel: "nemotron-3-120b-a12b",
+			Name: "Cloudflare", Type: "custom", DefaultModel: "@cf/nvidia/nemotron-3-120b-a12b",
 			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
 				headers := map[string]string{"Content-Type": "application/json"}
 				if cfg.APIKey != "" {
@@ -372,7 +373,7 @@ func init() {
 		},
 		"google": {
 			Name: "Gemini", Type: "cloud", DefaultModel: "gemini-2.5-flash",
-			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
+			BuildRequest: func(msgs[]Message, cfg ProviderConfig) APIRequest {
 				return APIRequest{
 					URL:     "https://generativelanguage.googleapis.com/v1beta/models/" + cfg.Model + ":generateContent?key=" + cfg.APIKey,
 					Headers: map[string]string{"Content-Type": "application/json"},
@@ -385,7 +386,7 @@ func init() {
 		},
 		"openai": {
 			Name: "OpenAI", Type: "cloud", DefaultModel: "gpt-4o",
-			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
+			BuildRequest: func(msgs[]Message, cfg ProviderConfig) APIRequest {
 				return APIRequest{
 					URL:     "https://api.openai.com/v1/chat/completions",
 					Headers: map[string]string{"Authorization": "Bearer " + cfg.APIKey, "Content-Type": "application/json"},
@@ -395,7 +396,7 @@ func init() {
 		},
 		"anthropic": {
 			Name: "Anthropic", Type: "cloud", DefaultModel: "claude-3-5-sonnet-20241022",
-			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
+			BuildRequest: func(msgs[]Message, cfg ProviderConfig) APIRequest {
 				return APIRequest{
 					URL: "https://api.anthropic.com/v1/messages",
 					Headers: map[string]string{
@@ -408,7 +409,7 @@ func init() {
 		},
 		"groq": {
 			Name: "Groq", Type: "cloud", DefaultModel: "llama-3.3-70b-versatile",
-			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
+			BuildRequest: func(msgs[]Message, cfg ProviderConfig) APIRequest {
 				return APIRequest{
 					URL:     "https://api.groq.com/openai/v1/chat/completions",
 					Headers: map[string]string{"Authorization": "Bearer " + cfg.APIKey, "Content-Type": "application/json"},
@@ -573,7 +574,7 @@ func printStatusBar() {
 	fmt.Printf("%s%s%s%s%s%s\n", BgGray, left, strings.Repeat(" ", padding), right, Reset, "")
 }
 
-func printFileDiff(filename string, oldLines, newLines []string, startLine int) {
+func printFileDiff(filename string, oldLines, newLines[]string, startLine int) {
 	fmt.Printf("\n  %s%s─── %s%s\n", Gray, Bold, filename, Reset)
 	maxOld, maxNew := 3, 5
 
@@ -608,6 +609,8 @@ func printToolCall(name string, args map[string]interface{}, result map[string]i
 		icon, color = "◈", Green
 	case "take_screenshot":
 		icon, color = "📷", Magenta
+	case "generate_image":
+		icon, color = "🎨", Magenta
 	case "shell":
 		icon, color = "▶", Yellow
 	}
@@ -620,6 +623,12 @@ func printToolCall(name string, args map[string]interface{}, result map[string]i
 
 	if filename, ok := args["filename"].(string); ok {
 		fmt.Printf(" %s%s%s", Gray, filename, Reset)
+	}
+	if promptStr, ok := args["prompt"].(string); ok {
+		if len(promptStr) > 30 {
+			promptStr = promptStr[:27] + "..."
+		}
+		fmt.Printf(" %s%s%s", Gray, promptStr, Reset)
 	}
 	if cmd, ok := args["command"].(string); ok {
 		if len(cmd) > 40 {
@@ -676,7 +685,7 @@ func printSuccess(msg string) {
 }
 
 func printSpinner(done chan bool, message string) {
-	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	frames :=[]string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	i := 0
 	for {
 		select {
@@ -719,10 +728,9 @@ func restoreMode(state string) {
 	cmd.Run()
 }
 
-func readLine(prompt string, history []string) string {
+func readLine(prompt string, history[]string) string {
 	state, err := setRawMode()
 	if err != nil {
-		// Fallback for Windows or systems without stty
 		fmt.Print(prompt)
 		if fallbackReader == nil {
 			fallbackReader = bufio.NewReader(os.Stdin)
@@ -732,7 +740,7 @@ func readLine(prompt string, history []string) string {
 	}
 	defer restoreMode(state)
 
-	var buf []rune
+	var buf[]rune
 	cursor := 0
 	histIdx := len(history)
 
@@ -768,7 +776,7 @@ func readLine(prompt string, history []string) string {
 			} else if c == 13 || c == 10 { // Enter
 				fmt.Println()
 				return string(buf)
-			} else if c == 12 { // Ctrl+L (Clear screen)
+			} else if c == 12 { // Ctrl+L
 				clearScreen()
 				redraw()
 				i++
@@ -785,14 +793,14 @@ func readLine(prompt string, history []string) string {
 						seq := b[i+2]
 						i += 3
 						switch seq {
-						case 'A': // Up Arrow
+						case 'A':
 							if histIdx > 0 {
 								histIdx--
 								buf = []rune(history[histIdx])
 								cursor = len(buf)
 								redraw()
 							}
-						case 'B': // Down Arrow
+						case 'B':
 							if histIdx < len(history)-1 {
 								histIdx++
 								buf = []rune(history[histIdx])
@@ -800,16 +808,16 @@ func readLine(prompt string, history []string) string {
 								redraw()
 							} else if histIdx == len(history)-1 {
 								histIdx++
-								buf = []rune{}
+								buf =[]rune{}
 								cursor = 0
 								redraw()
 							}
-						case 'C': // Right Arrow
+						case 'C':
 							if cursor < len(buf) {
 								cursor++
 								redraw()
 							}
-						case 'D': // Left Arrow
+						case 'D':
 							if cursor > 0 {
 								cursor--
 								redraw()
@@ -825,15 +833,12 @@ func readLine(prompt string, history []string) string {
 						i += 4
 						continue
 					}
-					// Unknown escape sequence, skip it
 					i = n
 				} else {
-					// Single ESC key -> clear the line
 					fmt.Println()
 					return ""
 				}
 			} else {
-				// Regular characters
 				r, size := utf8.DecodeRune(b[i:n])
 				if r != utf8.RuneError || size > 1 {
 					if strconv.IsPrint(r) {
@@ -863,7 +868,7 @@ func takeScreenshot(filename string) error {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		ps := `Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $s = [System.Windows.Forms.SystemInformation]::VirtualScreen; $b = New-Object System.Drawing.Bitmap $s.Width, $s.Height; $g = [System.Drawing.Graphics]::FromImage($b); $g.CopyFromScreen($s.Left, $s.Top, 0, 0, $b.Size); $b.Save('` + filename + `');`
+		ps := `Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $s =[System.Windows.Forms.SystemInformation]::VirtualScreen; $b = New-Object System.Drawing.Bitmap $s.Width, $s.Height; $g = [System.Drawing.Graphics]::FromImage($b); $g.CopyFromScreen($s.Left, $s.Top, 0, 0, $b.Size); $b.Save('` + filename + `');`
 		cmd = exec.Command("powershell", "-Command", ps)
 	case "darwin":
 		cmd = exec.Command("screencapture", "-x", filename)
@@ -931,8 +936,95 @@ func runTool(name string, args map[string]interface{}) map[string]interface{} {
 			}
 		}
 
+	case "generate_image":
+		promptStr := getString("prompt")
+		modelStr := getString("model")
+		if promptStr == "" || modelStr == "" {
+			result["error"] = "prompt and model are required parameters"
+			break
+		}
+
+		cfg, ok := state.configs[state.provider]
+		if !ok || cfg.Endpoint == "" {
+			result["error"] = "No API endpoint configured for current provider. Run /config to set it up."
+			break
+		}
+
+		// Dynamically replace {model} in the user's custom URL if it exists, otherwise it stays exactly the same
+		url := strings.ReplaceAll(cfg.Endpoint, "{model}", modelStr)
+
+		// Create the payload containing exactly what the worker expects
+		reqBody, _ := json.Marshal(map[string]interface{}{
+			"prompt": promptStr,
+			"model":  modelStr,
+		})
+
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(reqBody))
+		if err != nil {
+			result["error"] = err.Error()
+			break
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		if cfg.APIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+		}
+
+		client := &http.Client{Timeout: 90 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			result["error"] = err.Error()
+			break
+		}
+		defer resp.Body.Close()
+
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			result["error"] = err.Error()
+			break
+		}
+
+		// Handle JSON responses (e.g., Cloudflare JSON wrapping the base64 string)
+		if len(bodyBytes) > 0 && bodyBytes[0] == '{' {
+			var jsonRes map[string]interface{}
+			if err := json.Unmarshal(bodyBytes, &jsonRes); err == nil {
+				if success, ok := jsonRes["success"].(bool); ok && !success {
+					result["error"] = fmt.Sprintf("API Error: %s", string(bodyBytes))
+					break
+				}
+				// Look for result.image (Cloudflare format) or just image (generic fallback format)
+				if resMap, ok := jsonRes["result"].(map[string]interface{}); ok {
+					if b64img, ok := resMap["image"].(string); ok {
+						if dec, err := base64.StdEncoding.DecodeString(b64img); err == nil {
+							bodyBytes = dec
+						}
+					}
+				} else if b64img, ok := jsonRes["image"].(string); ok {
+					if dec, err := base64.StdEncoding.DecodeString(b64img); err == nil {
+						bodyBytes = dec
+					}
+				}
+			}
+		}
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			result["error"] = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+			break
+		}
+
+		fileName := fmt.Sprintf("generated_image_%s.png", time.Now().Format("20060102_150405"))
+		err = os.WriteFile(fileName, bodyBytes, 0644)
+		if err != nil {
+			result["error"] = err.Error()
+		} else {
+			result["success"] = true
+			result["filename"] = fileName
+			result["size_bytes"] = len(bodyBytes)
+			result["_image_file"] = fileName // Feeds directly back into vision!
+		}
+
 	case "list_files":
-		var files []string
+		var files[]string
 		filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
 			if err != nil || (info.IsDir() && info.Name() != "." && strings.HasPrefix(info.Name(), ".")) {
 				return filepath.SkipDir
@@ -953,7 +1045,7 @@ func runTool(name string, args map[string]interface{}) map[string]interface{} {
 			break
 		}
 		lines := strings.Split(string(content), "\n")
-		var results []string
+		var results[]string
 		for i, line := range lines {
 			if strings.Contains(strings.ToLower(line), query) {
 				results = append(results, fmt.Sprintf("%d | %s", i+1, line))
@@ -980,7 +1072,7 @@ func runTool(name string, args map[string]interface{}) map[string]interface{} {
 		if end < 1 || end > len(lines) {
 			end = len(lines)
 		}
-		var numbered []string
+		var numbered[]string
 		for i := start - 1; i < end && i < len(lines); i++ {
 			numbered = append(numbered, fmt.Sprintf("%d | %s", i+1, lines[i]))
 		}
@@ -990,7 +1082,7 @@ func runTool(name string, args map[string]interface{}) map[string]interface{} {
 		filename := getString("filename")
 		content := getString("content")
 		os.MkdirAll(filepath.Dir(filename), 0755)
-		err := os.WriteFile(filename, []byte(content), 0644)
+		err := os.WriteFile(filename,[]byte(content), 0644)
 		if err != nil {
 			result["error"] = err.Error()
 		} else {
@@ -1018,7 +1110,7 @@ func runTool(name string, args map[string]interface{}) map[string]interface{} {
 		replacementLines := strings.Split(replaceWith, "\n")
 		newContent := append(lines[:start], append(replacementLines, lines[end:]...)...)
 
-		err = os.WriteFile(filename, []byte(strings.Join(newContent, "\n")), 0644)
+		err = os.WriteFile(filename,[]byte(strings.Join(newContent, "\n")), 0644)
 		if err != nil {
 			result["error"] = err.Error()
 		} else {
@@ -1063,7 +1155,7 @@ func runTool(name string, args map[string]interface{}) map[string]interface{} {
 				result["error"] = err.Error()
 			} else {
 				var callRes struct {
-					Content []struct {
+					Content[]struct {
 						Type string `json:"type"`
 						Text string `json:"text"`
 					} `json:"content"`
@@ -1301,6 +1393,13 @@ func runAI() {
 
 func getSystemPrompt() string {
 	cwd, _ := os.Getwd()
+	
+	// Default image model, overwritten dynamically if the user configured one
+	imgModel := "@cf/black-forest-labs/flux-1-schnell"
+	if cfg, ok := state.configs[state.provider]; ok && cfg.ImageModel != "" {
+		imgModel = cfg.ImageModel
+	}
+
 	prompt := fmt.Sprintf(`You are Axiom, an elite, highly capable multimodal AI agent.
 WORKSPACE: %s
 OS: %s
@@ -1325,11 +1424,13 @@ TOOLS (respond with JSON in code blocks):
 6. **shell**
    `+"```json\n"+`{"tool": "shell", "args": {"command": "curl -s 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd'"}}`+"\n```"+`
 7. **take_screenshot** (Take a picture of the user's screen and look at it!)
-   `+"```json\n"+`{"tool": "take_screenshot", "args": {}}`+"\n```", cwd, runtime.GOOS)
+   `+"```json\n"+`{"tool": "take_screenshot", "args": {}}`+"\n```"+`
+8. **generate_image** (Generate an image dynamically using the active API endpoint)
+   `+"```json\n"+`{"tool": "generate_image", "args": {"prompt": "A cyberpunk cat", "model": "%s"}}`+"\n```", cwd, runtime.GOOS, imgModel)
 
 	// Dynamically Append Discovered MCP Tools
 	if len(state.mcpTools) > 0 {
-		prompt += "\n\nEXTERNAL MCP TOOLS (Available via standard JSON tool calls):\n"
+		prompt += "\n\nEXTERNAL MCP Tools (Available via standard JSON tool calls):\n"
 		for _, t := range state.mcpTools {
 			prompt += fmt.Sprintf("- **%s** (from %s)\n  Description: %s\n  Schema: %s\n", t.Name, t.ServerName, t.Description, t.InputSchema)
 		}
@@ -1413,21 +1514,39 @@ func handleConfig() {
 		}
 	}
 
+	// 1. PROMPT FOR TEXT/CHAT MODEL
 	defaultModel := prov.DefaultModel
 	if cfg.Model != "" {
 		defaultModel = cfg.Model
 	}
-	prompt = fmt.Sprintf("  %sModel%s [%s]: ", Bold, Reset, defaultModel)
-	m := strings.TrimSpace(readLine(prompt, nil))
+	promptM := fmt.Sprintf("  %sChat Model%s [%s]: ", Bold, Reset, defaultModel)
+	m := strings.TrimSpace(readLine(promptM, nil))
 	if m != "" {
 		cfg.Model = m
 	} else if cfg.Model == "" {
 		cfg.Model = prov.DefaultModel
 	}
 
+	// 2. PROMPT FOR IMAGE GEN MODEL
+	defaultImgModel := "@cf/black-forest-labs/flux-1-schnell"
+	if cfg.ImageModel != "" {
+		defaultImgModel = cfg.ImageModel
+	}
+	promptImg := fmt.Sprintf("  %sImage Model%s [%s]: ", Bold, Reset, defaultImgModel)
+	imgM := strings.TrimSpace(readLine(promptImg, nil))
+	if imgM != "" {
+		cfg.ImageModel = imgM
+	} else if cfg.ImageModel == "" {
+		cfg.ImageModel = defaultImgModel
+	}
+
 	state.configs[p] = cfg
 	state.connected = true
 	saveConfig()
+	
+	// Reset conversation history so the system prompt fully refreshes with the new ImageModel string
+	state.history =[]Message{} 
+	
 	printSuccess(fmt.Sprintf("Connected to %s (%s)", prov.Name, cfg.Model))
 	printStatusBar()
 }
@@ -1448,13 +1567,16 @@ func handleStatus() {
 	elapsed := time.Since(state.startTime).Truncate(time.Second)
 
 	fmt.Printf("\n  %sProvider%s      %s%s%s\n", Dim, Reset, Green, prov.Name, Reset)
-	fmt.Printf("  %sModel%s         %s\n", Dim, Reset, model)
+	fmt.Printf("  %sChat Model%s    %s\n", Dim, Reset, model)
+	if cfg.ImageModel != "" {
+		fmt.Printf("  %sImage Model%s   %s\n", Dim, Reset, cfg.ImageModel)
+	}
 	fmt.Printf("  %sSession%s       %s\n", Dim, Reset, elapsed)
 	fmt.Printf("  %sMessages%s      %d\n", Dim, Reset, len(state.history))
 
 	fmt.Printf("  %sMCP Servers%s   %d\n", Dim, Reset, len(state.mcpServers))
 	if len(state.mcpServers) > 0 {
-		var names []string
+		var names[]string
 		for k := range state.mcpServers {
 			names = append(names, k)
 		}
