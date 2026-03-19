@@ -1395,7 +1395,7 @@ func getSystemPrompt() string {
 	cwd, _ := os.Getwd()
 	
 	// Default image model, overwritten dynamically if the user configured one
-	imgModel := "@cf/black-forest-labs/flux-1-schnell"
+	imgModel := "@cf/black-forest-labs/flux-2-klein-9b"
 	if cfg, ok := state.configs[state.provider]; ok && cfg.ImageModel != "" {
 		imgModel = cfg.ImageModel
 	}
@@ -1528,7 +1528,7 @@ func handleConfig() {
 	}
 
 	// 2. PROMPT FOR IMAGE GEN MODEL
-	defaultImgModel := "@cf/black-forest-labs/flux-1-schnell"
+	defaultImgModel := "@cf/black-forest-labs/flux-2-klein-9b"
 	if cfg.ImageModel != "" {
 		defaultImgModel = cfg.ImageModel
 	}
