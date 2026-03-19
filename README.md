@@ -1,1 +1,2 @@
-<img width="1011" height="325" alt="image" src="https://github.com/user-attachments/assets/ae73fbea-ab53-40bd-928d-4c5ffd862596" />
+##GO RUN MAIN.GO##
+<img width="1062" height="672" alt="image" src="https://github.com/user-attachments/assets/03a20f34-a7f4-48da-b7fb-56732f06b5bd" />
