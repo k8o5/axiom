@@ -1649,7 +1649,7 @@ func sendMessage(text string) {
 func handleConfig() {
 	fmt.Println()
 	fmt.Printf("  %sPROVIDERS%s\n\n", Bold, Reset)
-	fmt.Printf("  %sCloud:%s    cloudflare google openai anthropic groq\n", Dim, Reset)
+	fmt.Printf("  %sCloud:%s    cloudflare google openai anthropic groq openrouter\n", Dim, Reset)
 	fmt.Printf("  %sLocal:%s    ollama lmstudio\n", Dim, Reset)
 	fmt.Println()
 
