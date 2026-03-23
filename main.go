@@ -33,9 +33,9 @@ var (
 	appCtxMutex      sync.Mutex
 )
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // ANSI STYLES
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 const (
 	Reset      = "\033[0m"
@@ -55,9 +55,9 @@ const (
 	ClearLine  = "\033[2K"
 )
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // CONFIG & STATE
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 func getConfigDir() string {
 	home, _ := os.UserHomeDir()
@@ -128,9 +128,9 @@ type ProviderDef struct {
 
 var PROVIDERS map[string]ProviderDef
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // MCP (MODEL CONTEXT PROTOCOL) CLIENT
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 type RPCMessage struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -299,9 +299,9 @@ func initMCPServer(name string, command []string) error {
 	return nil
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // PAYLOAD BUILDERS
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 func isVisionModel(model string) bool {
 	m := strings.ToLower(model)
@@ -443,6 +443,21 @@ func init() {
 				return APIRequest{URL: cfg.Endpoint, Headers: headers, Body: map[string]interface{}{"model": cfg.Model, "messages": buildOpenAIMessages(msgs, cfg.Model), "stream": false}}
 			},
 		},
+		"openrouter": {
+			Name: "OpenRouter", Type: "cloud", DefaultModel: "openai/gpt-4o",
+			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
+				return APIRequest{
+					URL: "https://openrouter.ai/api/v1/chat/completions",
+					Headers: map[string]string{
+						"Authorization": "Bearer " + cfg.APIKey,
+						"Content-Type":  "application/json",
+						"HTTP-Referer":  "https://github.com/axiom",
+						"X-Title":       "Axiom",
+					},
+					Body: map[string]interface{}{"model": cfg.Model, "messages": buildOpenAIMessages(msgs, cfg.Model), "temperature": 0.7},
+				}
+			},
+		},
 	}
 }
 
@@ -488,9 +503,9 @@ func saveConfig() error {
 	return os.WriteFile(getConfigPath(), data, 0600)
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // UI COMPONENTS
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 func clearScreen() {
 	fmt.Print("\033[H\033[2J")
@@ -729,15 +744,17 @@ func printSpinner(done chan bool, message string) {
 	}
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // TERMINAL INPUT & SIGNAL HANDLING
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 var fallbackReader *bufio.Reader
 
 func initTermState() {
 	if runtime.GOOS != "windows" {
-		out, err := exec.Command("stty", "-g").Output()
+		cmd := exec.Command("stty", "-g")
+		cmd.Stdin = os.Stdin
+		out, err := cmd.Output()
 		if err == nil {
 			initialTermState = strings.TrimSpace(string(out))
 		}
@@ -747,9 +764,15 @@ func initTermState() {
 func setupSignals() {
 	var globalLastSig time.Time
 	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+
+	signals := []os.Signal{os.Interrupt, syscall.SIGTERM}
+	if runtime.GOOS != "windows" {
+		signals = append(signals, syscall.SIGHUP, syscall.SIGQUIT)
+	}
+	signal.Notify(c, signals...)
+
 	go func() {
-		for range c {
+		for sig := range c {
 			appCtxMutex.Lock()
 			cancel := appCancel
 			appCtxMutex.Unlock()
@@ -757,13 +780,19 @@ func setupSignals() {
 			if cancel != nil {
 				cancel()
 			} else {
-				if !globalLastSig.IsZero() && time.Since(globalLastSig) < 2*time.Second {
+				if sig == os.Interrupt {
+					if !globalLastSig.IsZero() && time.Since(globalLastSig) < 2*time.Second {
+						restoreMode(initialTermState)
+						fmt.Println()
+						os.Exit(0)
+					}
+					globalLastSig = time.Now()
+					fmt.Print("\r\n  \033[33m(Press Ctrl+C again to exit)\033[0m\r\n\033[36m❯\033[0m ")
+				} else {
 					restoreMode(initialTermState)
 					fmt.Println()
 					os.Exit(0)
 				}
-				globalLastSig = time.Now()
-				fmt.Print("\r\n  \033[33m(Press Ctrl+C again to exit)\033[0m\r\n\033[36m❯\033[0m ")
 			}
 		}
 	}()
@@ -787,12 +816,22 @@ func setRawMode() (string, error) {
 }
 
 func restoreMode(state string) {
-	if state == "" || runtime.GOOS == "windows" {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	if state == "" {
+		cmd := exec.Command("stty", "sane")
+		cmd.Stdin = os.Stdin
+		cmd.Run()
 		return
 	}
 	cmd := exec.Command("stty", state)
 	cmd.Stdin = os.Stdin
-	cmd.Run()
+	if err := cmd.Run(); err != nil {
+		cmdFallback := exec.Command("stty", "sane")
+		cmdFallback.Stdin = os.Stdin
+		cmdFallback.Run()
+	}
 }
 
 func readLine(prompt string, history []string) string {
@@ -989,9 +1028,9 @@ func readLine(prompt string, history []string) string {
 	}
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // OS TOOLS & MCP ROUTER
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 func takeScreenshot(ctx context.Context, filename string) error {
 	var cmd *exec.Cmd
@@ -1309,9 +1348,9 @@ func runTool(ctx context.Context, name string, args map[string]interface{}) map[
 	return result
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // AI LOGIC
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 func parseAIResponse(data map[string]interface{}, rawString string) string {
 	if result, ok := data["result"].(map[string]interface{}); ok {
@@ -1603,14 +1642,14 @@ func sendMessage(text string) {
 	runAI()
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // COMMANDS
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 func handleConfig() {
 	fmt.Println()
 	fmt.Printf("  %sPROVIDERS%s\n\n", Bold, Reset)
-	fmt.Printf("  %sCloud:%s    cloudflare google openai anthropic groq\n", Dim, Reset)
+	fmt.Printf("  %sCloud:%s    cloudflare google openai anthropic groq openrouter\n", Dim, Reset)
 	fmt.Printf("  %sLocal:%s    ollama lmstudio\n", Dim, Reset)
 	fmt.Println()
 
@@ -1768,12 +1807,13 @@ func printWelcome() {
 	}
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 // MAIN
-// ═══════════════════════════════════════════════════════════════════════════════
+// ===============================================================================
 
 func main() {
 	initTermState()
+	defer restoreMode(initialTermState)
 	setupSignals()
 	loadConfig()
 	printWelcome()
