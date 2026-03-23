@@ -737,7 +737,9 @@ var fallbackReader *bufio.Reader
 
 func initTermState() {
 	if runtime.GOOS != "windows" {
-		out, err := exec.Command("stty", "-g").Output()
+		cmd := exec.Command("stty", "-g")
+		cmd.Stdin = os.Stdin
+		out, err := cmd.Output()
 		if err == nil {
 			initialTermState = strings.TrimSpace(string(out))
 		}
@@ -747,9 +749,15 @@ func initTermState() {
 func setupSignals() {
 	var globalLastSig time.Time
 	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+
+	signals := []os.Signal{os.Interrupt, syscall.SIGTERM}
+	if runtime.GOOS != "windows" {
+		signals = append(signals, syscall.SIGHUP, syscall.SIGQUIT)
+	}
+	signal.Notify(c, signals...)
+
 	go func() {
-		for range c {
+		for sig := range c {
 			appCtxMutex.Lock()
 			cancel := appCancel
 			appCtxMutex.Unlock()
@@ -757,13 +765,19 @@ func setupSignals() {
 			if cancel != nil {
 				cancel()
 			} else {
-				if !globalLastSig.IsZero() && time.Since(globalLastSig) < 2*time.Second {
+				if sig == os.Interrupt {
+					if !globalLastSig.IsZero() && time.Since(globalLastSig) < 2*time.Second {
+						restoreMode(initialTermState)
+						fmt.Println()
+						os.Exit(0)
+					}
+					globalLastSig = time.Now()
+					fmt.Print("\r\n  \033[33m(Press Ctrl+C again to exit)\033[0m\r\n\033[36m❯\033[0m ")
+				} else {
 					restoreMode(initialTermState)
 					fmt.Println()
 					os.Exit(0)
 				}
-				globalLastSig = time.Now()
-				fmt.Print("\r\n  \033[33m(Press Ctrl+C again to exit)\033[0m\r\n\033[36m❯\033[0m ")
 			}
 		}
 	}()
@@ -787,12 +801,22 @@ func setRawMode() (string, error) {
 }
 
 func restoreMode(state string) {
-	if state == "" || runtime.GOOS == "windows" {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	if state == "" {
+		cmd := exec.Command("stty", "sane")
+		cmd.Stdin = os.Stdin
+		cmd.Run()
 		return
 	}
 	cmd := exec.Command("stty", state)
 	cmd.Stdin = os.Stdin
-	cmd.Run()
+	if err := cmd.Run(); err != nil {
+		cmdFallback := exec.Command("stty", "sane")
+		cmdFallback.Stdin = os.Stdin
+		cmdFallback.Run()
+	}
 }
 
 func readLine(prompt string, history []string) string {
@@ -1774,6 +1798,7 @@ func printWelcome() {
 
 func main() {
 	initTermState()
+	defer restoreMode(initialTermState)
 	setupSignals()
 	loadConfig()
 	printWelcome()
