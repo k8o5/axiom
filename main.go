@@ -443,6 +443,21 @@ func init() {
 				return APIRequest{URL: cfg.Endpoint, Headers: headers, Body: map[string]interface{}{"model": cfg.Model, "messages": buildOpenAIMessages(msgs, cfg.Model), "stream": false}}
 			},
 		},
+		"openrouter": {
+			Name: "OpenRouter", Type: "cloud", DefaultModel: "openai/gpt-4o",
+			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
+				return APIRequest{
+					URL: "https://openrouter.ai/api/v1/chat/completions",
+					Headers: map[string]string{
+						"Authorization": "Bearer " + cfg.APIKey,
+						"Content-Type":  "application/json",
+						"HTTP-Referer":  "https://github.com/axiom",
+						"X-Title":       "Axiom",
+					},
+					Body: map[string]interface{}{"model": cfg.Model, "messages": buildOpenAIMessages(msgs, cfg.Model), "temperature": 0.7},
+				}
+			},
+		},
 	}
 }
 
