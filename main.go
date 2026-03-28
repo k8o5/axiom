@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -1136,7 +1137,10 @@ func runTool(ctx context.Context, name string, args map[string]interface{}) map[
 			req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 		}
 
-		client := &http.Client{Timeout: 90 * time.Second}
+		tr := &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: os.Getenv("AXIOM_INSECURE") == "true"},
+		}
+		client := &http.Client{Transport: tr, Timeout: 90 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {
 			result["error"] = err.Error()
@@ -1444,7 +1448,10 @@ func runAI() {
 			req.Header.Set(k, v)
 		}
 
-		client := &http.Client{Timeout: 120 * time.Second}
+		tr := &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: os.Getenv("AXIOM_INSECURE") == "true"},
+		}
+		client := &http.Client{Transport: tr, Timeout: 120 * time.Second}
 		resp, err := client.Do(req)
 
 		done <- true
