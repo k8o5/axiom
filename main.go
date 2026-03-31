@@ -33,9 +33,9 @@ var (
 	appCtxMutex      sync.Mutex
 )
 
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 // ANSI STYLES
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 
 const (
 	Reset      = "\033[0m"
@@ -55,9 +55,9 @@ const (
 	ClearLine  = "\033[2K"
 )
 
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 // CONFIG & STATE
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 
 func getConfigDir() string {
 	home, _ := os.UserHomeDir()
@@ -128,9 +128,9 @@ type ProviderDef struct {
 
 var PROVIDERS map[string]ProviderDef
 
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 // MCP (MODEL CONTEXT PROTOCOL) CLIENT
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 
 type RPCMessage struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -299,9 +299,9 @@ func initMCPServer(name string, command []string) error {
 	return nil
 }
 
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 // PAYLOAD BUILDERS
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 
 func isVisionModel(model string) bool {
 	m := strings.ToLower(model)
@@ -387,6 +387,21 @@ func init() {
 				return APIRequest{URL: cfg.Endpoint, Headers: headers, Body: map[string]interface{}{"model": cfg.Model, "messages": buildOpenAIMessages(msgs, cfg.Model)}}
 			},
 		},
+		"openrouter": {
+			Name: "OpenRouter", Type: "cloud", DefaultModel: "anthropic/claude-3.5-sonnet",
+			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
+				return APIRequest{
+					URL: "https://openrouter.ai/api/v1/chat/completions",
+					Headers: map[string]string{
+						"Authorization": "Bearer " + cfg.APIKey,
+						"Content-Type":  "application/json",
+						"HTTP-Referer":  "https://github.com/axiom",
+						"X-Title":       "Axiom CLI",
+					},
+					Body: map[string]interface{}{"model": cfg.Model, "messages": buildOpenAIMessages(msgs, cfg.Model), "temperature": 0.7},
+				}
+			},
+		},
 		"google": {
 			Name: "Gemini", Type: "cloud", DefaultModel: "gemini-2.5-flash",
 			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
@@ -443,19 +458,24 @@ func init() {
 				return APIRequest{URL: cfg.Endpoint, Headers: headers, Body: map[string]interface{}{"model": cfg.Model, "messages": buildOpenAIMessages(msgs, cfg.Model), "stream": false}}
 			},
 		},
-		"openrouter": {
-			Name: "OpenRouter", Type: "cloud", DefaultModel: "openai/gpt-4o",
+		"lmstudio": {
+			Name: "LM Studio", Type: "local", DefaultModel: "local-model", DefaultEndpoint: "http://localhost:1234/v1/chat/completions",
 			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
-				return APIRequest{
-					URL: "https://openrouter.ai/api/v1/chat/completions",
-					Headers: map[string]string{
-						"Authorization": "Bearer " + cfg.APIKey,
-						"Content-Type":  "application/json",
-						"HTTP-Referer":  "https://github.com/axiom",
-						"X-Title":       "Axiom",
-					},
-					Body: map[string]interface{}{"model": cfg.Model, "messages": buildOpenAIMessages(msgs, cfg.Model), "temperature": 0.7},
+				headers := map[string]string{"Content-Type": "application/json"}
+				if cfg.APIKey != "" {
+					headers["Authorization"] = "Bearer " + cfg.APIKey
 				}
+				return APIRequest{URL: cfg.Endpoint, Headers: headers, Body: map[string]interface{}{"model": cfg.Model, "messages": buildOpenAIMessages(msgs, cfg.Model), "temperature": 0.7}}
+			},
+		},
+		"custom": {
+			Name: "Custom (OpenAI Compatible)", Type: "custom", DefaultModel: "gpt-4o", DefaultEndpoint: "https://api.openai.com/v1/chat/completions",
+			BuildRequest: func(msgs []Message, cfg ProviderConfig) APIRequest {
+				headers := map[string]string{"Content-Type": "application/json"}
+				if cfg.APIKey != "" {
+					headers["Authorization"] = "Bearer " + cfg.APIKey
+				}
+				return APIRequest{URL: cfg.Endpoint, Headers: headers, Body: map[string]interface{}{"model": cfg.Model, "messages": buildOpenAIMessages(msgs, cfg.Model), "temperature": 0.7}}
 			},
 		},
 	}
@@ -503,9 +523,9 @@ func saveConfig() error {
 	return os.WriteFile(getConfigPath(), data, 0600)
 }
 
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 // UI COMPONENTS
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 
 func clearScreen() {
 	fmt.Print("\033[H\033[2J")
@@ -744,9 +764,9 @@ func printSpinner(done chan bool, message string) {
 	}
 }
 
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 // TERMINAL INPUT & SIGNAL HANDLING
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 
 var fallbackReader *bufio.Reader
 
@@ -764,15 +784,9 @@ func initTermState() {
 func setupSignals() {
 	var globalLastSig time.Time
 	c := make(chan os.Signal, 1)
-
-	signals := []os.Signal{os.Interrupt, syscall.SIGTERM}
-	if runtime.GOOS != "windows" {
-		signals = append(signals, syscall.SIGHUP, syscall.SIGQUIT)
-	}
-	signal.Notify(c, signals...)
-
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
-		for sig := range c {
+		for range c {
 			appCtxMutex.Lock()
 			cancel := appCancel
 			appCtxMutex.Unlock()
@@ -780,19 +794,13 @@ func setupSignals() {
 			if cancel != nil {
 				cancel()
 			} else {
-				if sig == os.Interrupt {
-					if !globalLastSig.IsZero() && time.Since(globalLastSig) < 2*time.Second {
-						restoreMode(initialTermState)
-						fmt.Println()
-						os.Exit(0)
-					}
-					globalLastSig = time.Now()
-					fmt.Print("\r\n  \033[33m(Press Ctrl+C again to exit)\033[0m\r\n\033[36m❯\033[0m ")
-				} else {
+				if !globalLastSig.IsZero() && time.Since(globalLastSig) < 2*time.Second {
 					restoreMode(initialTermState)
 					fmt.Println()
 					os.Exit(0)
 				}
+				globalLastSig = time.Now()
+				fmt.Print("\r\n  \033[33m(Press Ctrl+C again to exit)\033[0m\r\n\033[36m❯\033[0m ")
 			}
 		}
 	}()
@@ -816,22 +824,12 @@ func setRawMode() (string, error) {
 }
 
 func restoreMode(state string) {
-	if runtime.GOOS == "windows" {
-		return
-	}
-	if state == "" {
-		cmd := exec.Command("stty", "sane")
-		cmd.Stdin = os.Stdin
-		cmd.Run()
+	if state == "" || runtime.GOOS == "windows" {
 		return
 	}
 	cmd := exec.Command("stty", state)
 	cmd.Stdin = os.Stdin
-	if err := cmd.Run(); err != nil {
-		cmdFallback := exec.Command("stty", "sane")
-		cmdFallback.Stdin = os.Stdin
-		cmdFallback.Run()
-	}
+	cmd.Run()
 }
 
 func readLine(prompt string, history []string) string {
@@ -1028,9 +1026,9 @@ func readLine(prompt string, history []string) string {
 	}
 }
 
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 // OS TOOLS & MCP ROUTER
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 
 func takeScreenshot(ctx context.Context, filename string) error {
 	var cmd *exec.Cmd
@@ -1348,9 +1346,9 @@ func runTool(ctx context.Context, name string, args map[string]interface{}) map[
 	return result
 }
 
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 // AI LOGIC
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 
 func parseAIResponse(data map[string]interface{}, rawString string) string {
 	if result, ok := data["result"].(map[string]interface{}); ok {
@@ -1642,15 +1640,15 @@ func sendMessage(text string) {
 	runAI()
 }
 
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 // COMMANDS
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 
 func handleConfig() {
 	fmt.Println()
 	fmt.Printf("  %sPROVIDERS%s\n\n", Bold, Reset)
 	fmt.Printf("  %sCloud:%s    cloudflare google openai anthropic groq openrouter\n", Dim, Reset)
-	fmt.Printf("  %sLocal:%s    ollama lmstudio\n", Dim, Reset)
+	fmt.Printf("  %sLocal:%s    ollama lmstudio custom\n", Dim, Reset)
 	fmt.Println()
 
 	prompt := fmt.Sprintf("  %sProvider%s [%s]: ", Bold, Reset, state.provider)
@@ -1681,7 +1679,7 @@ func handleConfig() {
 		}
 	}
 
-	if prov.Type != "local" || p == "ollama" {
+	if prov.Type != "local" || p == "ollama" || p == "lmstudio" || p == "custom" {
 		keyHint := "not set"
 		if cfg.APIKey != "" {
 			keyHint = "****" + cfg.APIKey[max(0, len(cfg.APIKey)-4):]
@@ -1807,9 +1805,9 @@ func printWelcome() {
 	}
 }
 
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 // MAIN
-// ===============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 
 func main() {
 	initTermState()
