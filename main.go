@@ -593,7 +593,7 @@ func printLogo() {
    ` + Cyan + `█▀█ ▄▀▄ █ ▀▄▀ █ ▀ █` + Reset + `
 `
 	fmt.Print(logo)
-	fmt.Println(Gray + "   AI Bot" + Reset)
+	fmt.Println(Gray + "   Coding Agent" + Reset)
 	fmt.Println()
 }
 
