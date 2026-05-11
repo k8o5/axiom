@@ -1,7 +1,4 @@
-> **CODING AGENT AXIOM**
 
-> **Quick Start:**
->
 ```
 go run main.go
 ```
@@ -9,5 +6,5 @@ go run main.go
 ```
 ▄▀▄ ▀▄▀ █ ▄▀▄ █▄ ▄█
 █▀█ ▄▀▄ █ ▀▄▀ █ ▀ █
-AI Bot
+Coding Agent
 ```
